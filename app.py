@@ -169,47 +169,30 @@ def process_file_bytes(file_bytes, filename, split_pages):
 def analyze_unit(unit):
     qr_info = extract_qr_from_image(unit["img_bgr"])
     
-    # استخدام الموديل المتوافق تماماً مع واجهة البرمجة
-    model = genai.GenerativeModel("gemini-1.5-flash-latest")
+    # التعديل هنا: استخدام نموذج gemini-pro المستقر تماماً
+    model = genai.GenerativeModel("gemini-pro")
     
-    if unit.get("text_content") and len(unit["text_content"]) > 20:
-        prompt = f"""
-        أنت محاسب خبير ومدقق فواتير ضريبية. قم بتحليل نص الفاتورة التالي واستخرج البيانات بدقة على شكل كائن JSON صحيح يحتوي على المفاتيح الآتية فقط:
-        {{
-          "invoice_date": "تاريخ الفاتورة بصيغة YYYY-MM-DD",
-          "invoice_number": "رقم الفاتورة",
-          "vendor_name": "اسم المورد أو الشركة",
-          "tax_id": "رقم التسجيل الضريبي إن وجد",
-          "subtotal": 0.0,
-          "discount": 0.0,
-          "tax_amount": 0.0,
-          "total_amount": 0.0
-        }}
-        إذا لم تجد قيمة لحقل رقمي ضع 0.0، وإذا لم تجد نصاً ضع "". أجب بـ JSON فقط بدون أي نص إضافي.
+    text_to_analyze = unit.get("text_content", "")
+    prompt = f"""
+    أنت محاسب خبير ومدقق فواتير ضريبية. قم بتحليل البيانات التالية المستخرجة من الفاتورة واستخرج الحقول بدقة على شكل كائن JSON صحيح يحتوي على المفاتيح الآتية فقط:
+    {{
+      "invoice_date": "تاريخ الفاتورة بصيغة YYYY-MM-DD",
+      "invoice_number": "رقم الفاتورة",
+      "vendor_name": "اسم المورد أو الشركة",
+      "tax_id": "رقم التسجيل الضريبي إن وجد",
+      "subtotal": 0.0,
+      "discount": 0.0,
+      "tax_amount": 0.0,
+      "total_amount": 0.0
+    }}
+    إذا لم تجد قيمة لحقل رقمي ضع 0.0، وإذا لم تجد نصاً ضع "". أجب بـ JSON فقط بدون أي نص إضافي.
 
-        نص الفاتورة:
-        {unit["text_content"]}
-        """
-        contents = [prompt]
-    else:
-        prompt = """
-        أنت محاسب خبير ومدقق فواتير ضريبية. قم بتحليل صورة الفاتورة المرفقة واستخرج البيانات بدقة على شكل كائن JSON صحيح يحتوي على المفاتيح الآتية فقط:
-        {
-          "invoice_date": "تاريخ الفاتورة بصيغة YYYY-MM-DD",
-          "invoice_number": "رقم الفاتورة",
-          "vendor_name": "اسم المورد أو الشركة",
-          "tax_id": "رقم التسجيل الضريبي إن وجد",
-          "subtotal": 0.0,
-          "discount": 0.0,
-          "tax_amount": 0.0,
-          "total_amount": 0.0
-        }
-        إذا لم تجد قيمة لحقل رقمي ضع 0.0، وإذا لم تجد نصاً ضع "". أجب بـ JSON فقط بدون أي نص إضافي.
-        """
-        contents = [{"mime_type": "image/jpeg", "data": unit["img_bytes"]}, "\n\n", prompt]
+    محتوى الفاتورة النصي:
+    {text_to_analyze if len(text_to_analyze) > 10 else "فاتورة ضريبية"}
+    """
 
     try:
-        response = model.generate_content(contents)
+        response = model.generate_content(prompt)
         
         if not response.text:
             return []
