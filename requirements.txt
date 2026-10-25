@@ -1,7 +1,5 @@
 streamlit
-requests
 PyMuPDF
-opencv-python-headless
-numpy
 pandas
 openpyxl
+Pillow
