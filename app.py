@@ -14,6 +14,9 @@ from openpyxl.styles import PatternFill, Font, Alignment
 
 st.set_page_config(page_title="نظام تدقيق وتحليل الفواتير الضريبية", page_icon="🧾", layout="wide")
 
+# ==========================================
+# نظام حماية بكلمة المرور للمحاسبين
+# ==========================================
 def check_password():
     correct_password = ""
     try:
@@ -44,6 +47,32 @@ def check_password():
 if not check_password():
     st.stop()
 
+# ==========================================
+# الكشف التلقائي عن أحدث موديل متاح في حسابك
+# ==========================================
+@st.cache_resource
+def get_working_model_name(api_key_str: str) -> str:
+    genai.configure(api_key=api_key_str)
+    try:
+        available_models = [
+            m.name for m in genai.list_models() 
+            if "generateContent" in m.supported_generation_methods
+        ]
+        # ترتيب الأولوية لأحدث وأسرع النماذج التي تدعم الصور والنصوص
+        preferred_keywords = ["2.5-flash", "2.0-flash", "flash", "pro"]
+        for keyword in preferred_keywords:
+            for model_name in available_models:
+                if keyword in model_name.lower() and "vision" not in model_name.lower():
+                    return model_name
+        if available_models:
+            return available_models[0]
+    except Exception:
+        pass
+    return "models/gemini-2.5-flash"
+
+# ==========================================
+# دوال تحليل QR والتدقيق المحاسبي
+# ==========================================
 TOLERANCE = 0.05
 
 def decode_tlv_base64(b64_string: str) -> dict:
@@ -166,15 +195,14 @@ def process_file_bytes(file_bytes, filename, split_pages):
         st.error(f"خطأ في قراءة الملف {filename}: {e}")
     return units
 
-def analyze_unit(unit):
+def analyze_unit(unit, active_model_name):
     qr_info = extract_qr_from_image(unit["img_bgr"])
+    model = genai.GenerativeModel(active_model_name)
     
-    # التعديل هنا: استخدام نموذج gemini-pro المستقر تماماً
-    model = genai.GenerativeModel("gemini-pro")
+    text_hint = f"\nالنص المستخرج من الصفحة للاستعانة به:\n{unit['text_content']}" if unit.get("text_content") else ""
     
-    text_to_analyze = unit.get("text_content", "")
     prompt = f"""
-    أنت محاسب خبير ومدقق فواتير ضريبية. قم بتحليل البيانات التالية المستخرجة من الفاتورة واستخرج الحقول بدقة على شكل كائن JSON صحيح يحتوي على المفاتيح الآتية فقط:
+    أنت محاسب خبير ومدقق فواتير ضريبية. قم بتحليل صورة الفاتورة المرفقة (والنص المرفق إن وجد) واستخرج البيانات بدقة على شكل كائن JSON صحيح يحتوي على المفاتيح الآتية فقط:
     {{
       "invoice_date": "تاريخ الفاتورة بصيغة YYYY-MM-DD",
       "invoice_number": "رقم الفاتورة",
@@ -186,22 +214,22 @@ def analyze_unit(unit):
       "total_amount": 0.0
     }}
     إذا لم تجد قيمة لحقل رقمي ضع 0.0، وإذا لم تجد نصاً ضع "". أجب بـ JSON فقط بدون أي نص إضافي.
-
-    محتوى الفاتورة النصي:
-    {text_to_analyze if len(text_to_analyze) > 10 else "فاتورة ضريبية"}
+    {text_hint}
     """
 
+    contents = [{"mime_type": "image/jpeg", "data": unit["img_bytes"]}, prompt]
+
     try:
-        response = model.generate_content(prompt)
+        response = model.generate_content(contents)
         
         if not response.text:
             return []
 
         text_res = response.text.strip()
-        if text_res.startswith("```json"):
-            text_res = text_res[7:]
-        if text_res.endswith("```"):
-            text_res = text_res[:-3]
+        # استخراج كائن JSON بنجاح حتى لو وجد نص حوله
+        json_match = re.search(r'(\{.*\}|\[.*\])', text_res, re.DOTALL)
+        if json_match:
+            text_res = json_match.group(1)
             
         parsed_data = json.loads(text_res.strip())
         invoices_list = parsed_data if isinstance(parsed_data, list) else [parsed_data]
@@ -323,6 +351,9 @@ def export_to_multi_sheet_excel(raw_records: list, output_excel: str):
                 col_letter = col[0].column_letter
                 ws.column_dimensions[col_letter].width = max(max_len + 4, 15)
 
+# ==========================================
+# واجهة المستخدم عبر Streamlit
+# ==========================================
 st.title("🧾 نظام تحليل وفحص الفواتير الضريبية (AI + QR)")
 st.markdown("ارفع فواتيرك (PDF أو صور) وسيقوم النظام باستخراج البيانات وتدقيقها محاسبياً وتصدير تقرير إكسيل احترافي بشيتين.")
 
@@ -349,6 +380,9 @@ uploaded_files = st.file_uploader("اختر ملفات الفواتير (PDF أ�
 
 if uploaded_files and api_key:
     genai.configure(api_key=api_key)
+    active_model = get_working_model_name(api_key)
+    st.sidebar.info(f"🤖 الموديل النشط: `{active_model}`")
+
     if st.button("🚀 بدء التحليل والفحص الشامل", type="primary"):
         all_units = []
         for file in uploaded_files:
@@ -363,7 +397,7 @@ if uploaded_files and api_key:
         total = len(all_units)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_unit = {executor.submit(analyze_unit, u): u for u in all_units}
+            future_to_unit = {executor.submit(analyze_unit, u, active_model): u for u in all_units}
             for future in as_completed(future_to_unit):
                 res = future.result()
                 if res:
@@ -386,7 +420,7 @@ if uploaded_files and api_key:
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             
-            with st.expander("عرض السجل التفصيلي للفواتير المستخرجة"):
+            with st.expander("عرض السجل التفصيلي للفواتير المستخرجة", expanded=True):
                 st.dataframe(pd.DataFrame(raw_results), use_container_width=True)
         else:
             st.warning("لم يتم استخراج أي بيانات. يرجى التأكد من وضوح الفواتير المرفوعة.")
