@@ -1,8 +1,7 @@
 streamlit
-pandas
-openpyxl
-google-generativeai
-pydantic
+requests
 PyMuPDF
 opencv-python-headless
 numpy
+pandas
+openpyxl
