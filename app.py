@@ -12,12 +12,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 from openpyxl.styles import PatternFill, Font, Alignment
 
-# إعداد صفحة ستريمليت
 st.set_page_config(page_title="نظام تدقيق وتحليل الفواتير الضريبية", page_icon="🧾", layout="wide")
 
-# ==========================================
-# نظام حماية بكلمة المرور للمحاسبين
-# ==========================================
 def check_password():
     correct_password = ""
     try:
@@ -48,9 +44,6 @@ def check_password():
 if not check_password():
     st.stop()
 
-# ==========================================
-# 1. دوال تحليل QR والتدقيق المحاسبي
-# ==========================================
 TOLERANCE = 0.05
 
 def decode_tlv_base64(b64_string: str) -> dict:
@@ -146,7 +139,6 @@ def process_file_bytes(file_bytes, filename, split_pages):
                 page = doc[page_idx]
                 text_content = page.get_text()
                 
-                # استخراج الصورة أيضاً للـ QR
                 pix = page.get_pixmap(dpi=150)
                 img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
                 img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR if pix.n == 3 else cv2.COLOR_RGBA2BGR)
@@ -177,9 +169,9 @@ def process_file_bytes(file_bytes, filename, split_pages):
 def analyze_unit(unit):
     qr_info = extract_qr_from_image(unit["img_bgr"])
     
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    # استخدام الموديل المتوافق تماماً مع واجهة البرمجة
+    model = genai.GenerativeModel("gemini-1.5-flash-latest")
     
-    # إذا كان الملف يحتوي على نص مستخرج مباشرة من الـ PDF، نرسله كنص لتجنب أخطاء قراءة الصور
     if unit.get("text_content") and len(unit["text_content"]) > 20:
         prompt = f"""
         أنت محاسب خبير ومدقق فواتير ضريبية. قم بتحليل نص الفاتورة التالي واستخرج البيانات بدقة على شكل كائن JSON صحيح يحتوي على المفاتيح الآتية فقط:
@@ -348,9 +340,6 @@ def export_to_multi_sheet_excel(raw_records: list, output_excel: str):
                 col_letter = col[0].column_letter
                 ws.column_dimensions[col_letter].width = max(max_len + 4, 15)
 
-# ==========================================
-# واجهة المستخدم عبر Streamlit
-# ==========================================
 st.title("🧾 نظام تحليل وفحص الفواتير الضريبية (AI + QR)")
 st.markdown("ارفع فواتيرك (PDF أو صور) وسيقوم النظام باستخراج البيانات وتدقيقها محاسبياً وتصدير تقرير إكسيل احترافي بشيتين.")
 
