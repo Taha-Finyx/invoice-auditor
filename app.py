@@ -1,15 +1,12 @@
 import os
 import re
 import json
-import time
 import base64
-import shutil
 import fitz  # PyMuPDF
 import cv2
 import numpy as np
 import pandas as pd
-from typing import List
-from pydantic import BaseModel, Field
+from typing import List, Optional
 import google.generativeai as genai
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
@@ -52,24 +49,9 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 1. نماذج البيانات والدوال المحاسبية
+# 1. دوال تحليل QR والتدقيق المحاسبي
 # ==========================================
 TOLERANCE = 0.05
-
-class SingleInvoice(BaseModel):
-    invoice_date: str = Field(default="", description="تاريخ الفاتورة")
-    invoice_number: str = Field(default="", description="رقم الفاتورة")
-    vendor_name: str = Field(default="", description="اسم المورد")
-    tax_id: str = Field(default="", description="رقم التسجيل الضريبي")
-    subtotal: float = Field(default=0.0, description="القيمة قبل الضريبة والخصم")
-    discount: float = Field(default=0.0, description="الخصم")
-    tax_amount: float = Field(default=0.0, description="الضريبة")
-    total_amount: float = Field(default=0.0, description="الإجمالي شامل الضريبة")
-    is_continuation: bool = Field(default=False)
-    missing_totals: bool = Field(default=False)
-
-class PageInvoicesList(BaseModel):
-    invoices: List[SingleInvoice]
 
 def decode_tlv_base64(b64_string: str) -> dict:
     try:
@@ -96,6 +78,8 @@ def decode_tlv_base64(b64_string: str) -> dict:
         return None
 
 def extract_qr_from_image(img_bgr) -> dict:
+    if img_bgr is None:
+        return None
     detector = cv2.QRCodeDetector()
     for scale in [1.0, 1.5, 0.75]:
         resized = cv2.resize(img_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC) if scale != 1.0 else img_bgr
@@ -106,16 +90,6 @@ def extract_qr_from_image(img_bgr) -> dict:
                 return decoded_tlv
             return {"qr_raw": data, "qr_total": None, "qr_tax": None, "qr_tax_id": ""}
     return None
-
-def normalize_text(val: str) -> str:
-    if not val or pd.isna(val):
-        return ""
-    val = str(val).strip().lower()
-    val = val.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789"))
-    val = re.sub(r"[\s\-_/#:\\.,]", "", val)
-    if val.isdigit():
-        val = val.lstrip("0") or "0"
-    return val
 
 def perform_full_audit(data: dict, qr_info: dict = None) -> dict:
     if qr_info is None:
@@ -160,24 +134,28 @@ def perform_full_audit(data: dict, qr_info: dict = None) -> dict:
         data["qr_tax"] = ""
         data["qr_match_status"] = "ℹ️ QR غير مشفر"
 
-    data["_qr_info"] = qr_info
     return data
 
 def process_file_bytes(file_bytes, filename, split_pages):
     ext = filename.lower()
     units = []
     try:
-        if ext.endswith(".pdf") and split_pages:
+        if ext.endswith(".pdf"):
             doc = fitz.open(stream=file_bytes, filetype="pdf")
             for page_idx in range(len(doc)):
                 page = doc[page_idx]
-                pix = page.get_pixmap(dpi=200)
+                text_content = page.get_text()
+                
+                # استخراج الصورة أيضاً للـ QR
+                pix = page.get_pixmap(dpi=150)
                 img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
                 img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR if pix.n == 3 else cv2.COLOR_RGBA2BGR)
-                _, buffer = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                _, buffer = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+                
                 units.append({
                     "filename": filename,
                     "page_num": page_idx + 1,
+                    "text_content": text_content.strip(),
                     "img_bytes": buffer.tobytes(),
                     "img_bgr": img_bgr
                 })
@@ -188,6 +166,7 @@ def process_file_bytes(file_bytes, filename, split_pages):
             units.append({
                 "filename": filename,
                 "page_num": 1,
+                "text_content": "",
                 "img_bytes": file_bytes,
                 "img_bgr": img_bgr
             })
@@ -196,32 +175,86 @@ def process_file_bytes(file_bytes, filename, split_pages):
     return units
 
 def analyze_unit(unit):
-    qr_info = extract_qr_from_image(unit["img_bgr"]) if unit.get("img_bgr") is not None else None
+    qr_info = extract_qr_from_image(unit["img_bgr"])
+    
     model = genai.GenerativeModel("gemini-1.5-flash")
-    prompt = "قم بتحليل وثيقة الفاتورة المرفقة واستخرج البيانات المطلوبة بدقة بصيغة JSON."
+    
+    # إذا كان الملف يحتوي على نص مستخرج مباشرة من الـ PDF، نرسله كنص لتجنب أخطاء قراءة الصور
+    if unit.get("text_content") and len(unit["text_content"]) > 20:
+        prompt = f"""
+        أنت محاسب خبير ومدقق فواتير ضريبية. قم بتحليل نص الفاتورة التالي واستخرج البيانات بدقة على شكل كائن JSON صحيح يحتوي على المفاتيح الآتية فقط:
+        {{
+          "invoice_date": "تاريخ الفاتورة بصيغة YYYY-MM-DD",
+          "invoice_number": "رقم الفاتورة",
+          "vendor_name": "اسم المورد أو الشركة",
+          "tax_id": "رقم التسجيل الضريبي إن وجد",
+          "subtotal": 0.0,
+          "discount": 0.0,
+          "tax_amount": 0.0,
+          "total_amount": 0.0
+        }}
+        إذا لم تجد قيمة لحقل رقمي ضع 0.0، وإذا لم تجد نصاً ضع "". أجب بـ JSON فقط بدون أي نص إضافي.
+
+        نص الفاتورة:
+        {unit["text_content"]}
+        """
+        contents = [prompt]
+    else:
+        prompt = """
+        أنت محاسب خبير ومدقق فواتير ضريبية. قم بتحليل صورة الفاتورة المرفقة واستخرج البيانات بدقة على شكل كائن JSON صحيح يحتوي على المفاتيح الآتية فقط:
+        {
+          "invoice_date": "تاريخ الفاتورة بصيغة YYYY-MM-DD",
+          "invoice_number": "رقم الفاتورة",
+          "vendor_name": "اسم المورد أو الشركة",
+          "tax_id": "رقم التسجيل الضريبي إن وجد",
+          "subtotal": 0.0,
+          "discount": 0.0,
+          "tax_amount": 0.0,
+          "total_amount": 0.0
+        }
+        إذا لم تجد قيمة لحقل رقمي ضع 0.0، وإذا لم تجد نصاً ضع "". أجب بـ JSON فقط بدون أي نص إضافي.
+        """
+        contents = [{"mime_type": "image/jpeg", "data": unit["img_bytes"]}, "\n\n", prompt]
 
     try:
-        content_part = {"mime_type": "image/jpeg", "data": unit["img_bytes"]}
-        response = model.generate_content(
-            [content_part, "\n\n", prompt],
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-                response_schema=PageInvoicesList,
-                temperature=0.0
-            )
-        )
-        parsed_json = json.loads(response.text)
-        invoices_list = parsed_json.get("invoices", [])
+        response = model.generate_content(contents)
+        
+        if not response.text:
+            return []
+
+        text_res = response.text.strip()
+        if text_res.startswith("```json"):
+            text_res = text_res[7:]
+        if text_res.endswith("```"):
+            text_res = text_res[:-3]
+            
+        parsed_data = json.loads(text_res.strip())
+        invoices_list = parsed_data if isinstance(parsed_data, list) else [parsed_data]
         
         results = []
         for inv in invoices_list:
             inv["اسم_الملف"] = unit["filename"]
             inv["رقم_الصفحة"] = str(unit["page_num"])
-            inv = perform_full_audit(inv, qr_info if len(invoices_list) == 1 else None)
-            results.append(inv)
+            audited = perform_full_audit(inv, qr_info if len(invoices_list) == 1 else None)
+            results.append(audited)
         return results
-    except Exception:
-        return []
+    except Exception as e:
+        return [{
+            "اسم_الملف": unit["filename"],
+            "رقم_الصفحة": str(unit["page_num"]),
+            "invoice_date": "-",
+            "invoice_number": "-",
+            "vendor_name": f"خطأ معالجة: {str(e)}",
+            "tax_id": "-",
+            "subtotal": 0.0,
+            "discount": 0.0,
+            "tax_amount": 0.0,
+            "total_amount": 0.0,
+            "calculated_total": 0.0,
+            "difference": 0.0,
+            "audit_status": "❌ خطأ في القراءة",
+            "qr_match_status": "⚪ بدون QR"
+        }]
 
 def export_to_multi_sheet_excel(raw_records: list, output_excel: str):
     df = pd.DataFrame(raw_records)
@@ -269,9 +302,7 @@ def export_to_multi_sheet_excel(raw_records: list, output_excel: str):
         "calculated_total": "الإجمالي المحسوب",
         "difference": "الفروق",
         "audit_status": "التدقيق المحاسبي",
-        "qr_match_status": "مطابقة QR",
-        "duplicate_status": "التكرار",
-        "حالة_المعالجة": "الحالة التقنية"
+        "qr_match_status": "مطابقة QR"
     }
     df = df.rename(columns=columns_mapping)
     ordered_cols = [col for col in columns_mapping.values() if col in df.columns]
@@ -318,7 +349,7 @@ def export_to_multi_sheet_excel(raw_records: list, output_excel: str):
                 ws.column_dimensions[col_letter].width = max(max_len + 4, 15)
 
 # ==========================================
-# واجهة التطبيق عبر Streamlit
+# واجهة المستخدم عبر Streamlit
 # ==========================================
 st.title("🧾 نظام تحليل وفحص الفواتير الضريبية (AI + QR)")
 st.markdown("ارفع فواتيرك (PDF أو صور) وسيقوم النظام باستخراج البيانات وتدقيقها محاسبياً وتصدير تقرير إكسيل احترافي بشيتين.")
@@ -370,7 +401,7 @@ if uploaded_files and api_key:
                 status_text.text(f"جاري معالجة الصفحة {completed} من {total}...")
 
         if raw_results:
-            st.success(f"🎉 تمت المعالجة بنجاح واستخلاص {len(raw_results)} فاتورة!")
+            st.success(f"🎉 تمت المعالجة بنجاح واستخلاص البيانات لـ {len(raw_results)} وحدة!")
             
             output_excel = "invoices_summary.xlsx"
             export_to_multi_sheet_excel(raw_results, output_excel)
@@ -386,6 +417,6 @@ if uploaded_files and api_key:
             with st.expander("عرض السجل التفصيلي للفواتير المستخرجة"):
                 st.dataframe(pd.DataFrame(raw_results), use_container_width=True)
         else:
-            st.warning("لم يتم استخراج أي بيانات.")
+            st.warning("لم يتم استخراج أي بيانات. يرجى التأكد من وضوح الفواتير المرفوعة.")
 elif uploaded_files and not api_key:
     st.error("يرجى إدخال مفتاح الـ API في الشريط الجانبي أو إعداده في الـ Secrets.")
