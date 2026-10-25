@@ -51,10 +51,10 @@ def local_regex_extract(text: str, filename: str) -> dict:
         "invoice_number": "",
         "vendor_name": "",
         "tax_id": "313066974700003",
-        "subtotal": 0.0,
-        "discount": 0.0,
-        "tax_amount": 0.0,
-        "total_amount": 0.0
+        "total_before_vat": 0.0,
+        "vat_value": 0.0,
+        "total_after_vat": 0.0,
+        "discount": 0.0
     }
 
     if not text:
@@ -62,61 +62,56 @@ def local_regex_extract(text: str, filename: str) -> dict:
         data["vendor_name"] = clean_fname.split('_')[0].strip()
         return data
 
-    # 1. استخراج اسم الفرع بدقة من ترويسة هنجرستيشن (مثل Invoice Details [اسم الفرع])
-    branch_match = re.search(r'Invoice\s+Details\s+([A-Za-z0-9\s\-\&\(\)\.\,\']+?)(?:\r?\n|Commissions|تﻻﻮﻤﻌﻟا|تفاصيل)', text, re.IGNORECASE)
+    # 1. استخراج اسم الفرع أو المورد من الترويسة بدقة
+    branch_match = re.search(r'(?:Invoice\s+Details|Booking\s+for\s+promoted\s+places\s+for\s+branch)\s+([A-Za-z0-9\s\-\&\(\)\.\,\']+?)(?:\r?\n|Commissions|تﻻﻮﻤﻌﻟا|تفاصيل|Amount|VAT|\d)', text, re.IGNORECASE)
     if branch_match:
         branch_name = branch_match.group(1).strip()
-        branch_name = re.sub(r'(Commissions|تﻻﻮﻤﻌﻟا|Details|تفاصيل|Quantity|الكمية).*', '', branch_name).strip()
         if len(branch_name) > 2:
             data["vendor_name"] = branch_name
 
     if not data["vendor_name"]:
         lines = [line.strip() for line in text.split('\n') if len(line.strip()) > 3]
         for line in lines[:10]:
-            if any(w in line for w in ["Global Culinary", "HungerStation", "طبرجل", "برجر", "نودلز", "تيك أوف", "باستا", "فرع"]):
+            if any(w in line for w in ["Global Culinary", "HungerStation", "الهدبانية", "برجر", "نودلز", "تيك أوف", "باستا", "فرع"]):
                 data["vendor_name"] = line
                 break
         if not data["vendor_name"]:
             clean_fname = re.sub(r'\.pdf$|\.jpg$|\.png$|\.jpeg$', '', filename, flags=re.IGNORECASE)
             data["vendor_name"] = clean_fname.split('_')[0].strip()
 
-    # 2. استخراج التاريخ
+    # 2. استخراج التاريخ ورقم الفاتورة
     date_match = re.search(r'(\d{4}[-/]\d{2}[-/]\d{2})', text)
     if date_match:
         data["invoice_date"] = date_match.group(1)
-    else:
-        fname_date = re.search(r'(202\d)(\d{2})(\d{2})', filename)
-        if fname_date:
-            data["invoice_date"] = f"{fname_date.group(1)}-{fname_date.group(2)}-{fname_date.group(3)}"
 
-    # 3. استخراج رقم الفاتورة
-    inv_match = re.search(r'(HS-[A-Za-z0-9\-/]+)', text)
+    inv_match = re.search(r'((?:HS-|Invoice\s*No)[A-Za-z0-9\-/]+)', text)
     if inv_match:
         data["invoice_number"] = inv_match.group(1).strip()
 
-    # 4. استخراج المبالغ المالية (بحث عن الإجمالي شامل الضريبة والضريبة والقطاعات)
-    # البحث عن نمط إجمالي الفاتورة بعد الضريبة (Total Invoice After VAT / إجمالي الفاتورة)
-    total_match = re.search(r'(?:Total\s+Invoice\s+After\s+VAT|إجمالي\s+الفاتورة|يلامجإ\s+ةروتافلا)[\s:.\-\|]*([\d,]+\.\d{2})', text, re.IGNORECASE)
-    if total_match:
-        data["total_amount"] = round(float(total_match.group(1).replace(',', '')), 2)
+    # 3. استخراج المعايير المالية بدقة بالأسماء المطلوبة تماماً
+    # Total Invoice Value Before VAT
+    tb_match = re.search(r'(?:Total\s+Invoice\s+Value\s+Before\s+VAT|اجمالي\s+قيمة\s+الفاتوره\s+قبل\s+الضريبة\s+المضافة|Total\s+Before\s+Tax)[\s:.\-\|]*([0-9,]+\.\d{2})', text, re.IGNORECASE)
+    if tb_match:
+        data["total_before_vat"] = round(float(tb_match.group(1).replace(',', '')), 2)
 
-    vat_match = re.search(r'(?:VAT\s+15%|ضريبة\s+القيمة\s+المضافة|ﺔﺒﻳﺮﺿ)[\s:.\-\|]*([\d,]+\.\d{2})', text, re.IGNORECASE)
+    # VAT Value (15.0%)
+    vat_match = re.search(r'(?:VAT\s+Value\s*\(\s*15\.?0?\s*%\s*\)|قيمة\s+الضريبة\s+المضافة\s*\(\s*15\.?0?\s*\)|Total\s+Tax\s+Amount)[\s:.\-\|]*([0-9,]+\.\d{2})', text, re.IGNORECASE)
     if vat_match:
-        data["tax_amount"] = round(float(vat_match.group(1).replace(',', '')), 2)
+        data["vat_value"] = round(float(vat_match.group(1).replace(',', '')), 2)
 
-    if data["total_amount"] > 0 and data["tax_amount"] > 0:
-        data["subtotal"] = round(data["total_amount"] - data["tax_amount"], 2)
-    elif data["total_amount"] > 0:
-        data["subtotal"] = round(data["total_amount"] / 1.15, 2)
-        data["tax_amount"] = round(data["total_amount"] - data["subtotal"], 2)
-    else:
-        # استخراج أرقام مالية عامة في الصفحة
-        amounts = re.findall(r'\b\d{1,3}(?:,\d{3})*\.\d{2}\b', text)
-        float_amounts = sorted(list(set([float(a.replace(',', '')) for a in amounts if float(a.replace(',', '')) > 0])))
-        if float_amounts:
-            data["total_amount"] = float_amounts[-1]
-            data["subtotal"] = round(data["total_amount"] / 1.15, 2)
-            data["tax_amount"] = round(data["total_amount"] - data["subtotal"], 2)
+    # Total Invoice Value After VAT
+    ta_match = re.search(r'(?:Total\s+Invoice\s+Value\s+After\s+VAT|اجمالي\s+قيمة\s+الفاتوره\s+بعد\s+الضريبة\s+المضافة|Total\s+Amount)[\s:.\-\|]*([0-9,]+\.\d{2})', text, re.IGNORECASE)
+    if ta_match:
+        data["total_after_vat"] = round(float(ta_match.group(1).replace(',', '')), 2)
+
+    # مطابقة الحسابات آلياً في حال نقص حقل
+    if data["total_after_vat"] == 0.0 and data["total_before_vat"] > 0:
+        if data["vat_value"] == 0.0:
+            data["vat_value"] = round(data["total_before_vat"] * 0.15, 2)
+        data["total_after_vat"] = round(data["total_before_vat"] + data["vat_value"], 2)
+    elif data["total_before_vat"] == 0.0 and data["total_after_vat"] > 0:
+        data["total_before_vat"] = round(data["total_after_vat"] / 1.15, 2)
+        data["vat_value"] = round(data["total_after_vat"] - data["total_before_vat"], 2)
 
     return data
 
@@ -134,36 +129,27 @@ def http_post_json(url: str, payload: dict, timeout: int = 30) -> dict:
 def call_gemini_rest_api(api_key: str, img_bytes: bytes, text_content: str) -> dict:
     api_key = api_key.strip()
     b64_img = base64.b64encode(img_bytes).decode("utf-8")
-
     models_to_try = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+    
     prompt = f"""
-    أنت مدقق فواتير ضريبية خبير. اقرأ ترويسة ونصوص وجداول الفاتورة الضريبية التالية بعناية استخراج البيانات التالية بدقة على شكل JSON يحتوي على المفاتيح التالية فقط:
+    أنت محاسب مدقق فواتير ضريبية خبير. استخرج البيانات التالية بالأسماء الدقيقة من الفاتورة وأرجعها بصيغة JSON فقط:
     {{
       "invoice_date": "YYYY-MM-DD",
       "invoice_number": "رقم الفاتورة",
-      "vendor_name": "اسم الفرع أو المورد بدقة",
+      "vendor_name": "اسم الفرع أو المورد",
       "tax_id": "الرقم الضريبي",
-      "subtotal": 0.0,
-      "discount": 0.0,
-      "tax_amount": 0.0,
-      "total_amount": 0.0,
-      "has_qr": true
+      "total_before_vat": 0.0,
+      "vat_value": 0.0,
+      "total_after_vat": 0.0
     }}
-    النص المستخرج من الصفحة:
+    النص المستخرج من الفاتورة:
     {text_content[:4000]}
     """
-
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
-            ]
-        }],
+        "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}]}],
         "generationConfig": {"temperature": 0.0}
     }
 
-    last_error = ""
     for model_name in models_to_try:
         for version in ["v1beta", "v1"]:
             url = f"https://generativelanguage.googleapis.com/{version}/models/{model_name}:generateContent?key={api_key}"
@@ -174,23 +160,21 @@ def call_gemini_rest_api(api_key: str, img_bytes: bytes, text_content: str) -> d
                 if json_match:
                     parsed = json.loads(json_match.group(1))
                     return parsed[0] if isinstance(parsed, list) else parsed
-            except Exception as e:
-                last_error = str(e)
-
-    raise RuntimeError(last_error)
+            except Exception:
+                continue
+    return {}
 
 def perform_full_audit(data: dict) -> dict:
-    subtotal = float(data.get("subtotal") or 0.0)
-    discount = float(data.get("discount") or 0.0)
-    tax = float(data.get("tax_amount") or 0.0)
-    extracted_total = float(data.get("total_amount") or 0.0)
+    tb = float(data.get("total_before_vat") or 0.0)
+    vat = float(data.get("vat_value") or 0.0)
+    ta = float(data.get("total_after_vat") or 0.0)
 
-    calculated_total = round(subtotal - discount + tax, 2)
-    diff = round(extracted_total - calculated_total, 2)
+    calculated_total = round(tb + vat, 2)
+    diff = round(ta - calculated_total, 2)
     data["calculated_total"] = calculated_total
     data["difference"] = diff
 
-    if extracted_total == 0 and subtotal == 0:
+    if ta == 0 and tb == 0:
         data["audit_status"] = "⚠️ القيم صفرية (تحتاج مراجعة)"
     elif abs(diff) <= TOLERANCE:
         data["audit_status"] = "✓ مطابق حسابياً"
@@ -210,12 +194,11 @@ def process_file_bytes(file_bytes, filename, split_pages):
                 page = doc[page_idx]
                 text_content = page.get_text("text")
                 pix = page.get_pixmap(dpi=150)
-                img_bytes = pix.tobytes("jpeg")
                 units.append({
                     "filename": filename,
                     "page_num": page_idx + 1,
                     "text_content": text_content.strip(),
-                    "img_bytes": img_bytes
+                    "img_bytes": pix.tobytes("jpeg")
                 })
             doc.close()
         else:
@@ -231,9 +214,8 @@ def process_file_bytes(file_bytes, filename, split_pages):
 
 def analyze_unit(unit, api_key: str):
     local_data = local_regex_extract(unit.get("text_content", ""), unit["filename"])
-    
     inv_data = None
-    if api_key and (local_data["total_amount"] == 0 or not local_data["vendor_name"]):
+    if api_key and local_data["total_after_vat"] == 0:
         try:
             inv_data = call_gemini_rest_api(api_key, unit["img_bytes"], unit.get("text_content", ""))
         except Exception:
@@ -242,14 +224,13 @@ def analyze_unit(unit, api_key: str):
     if not inv_data:
         inv_data = local_data
     else:
-        for key in ["vendor_name", "tax_id", "invoice_date", "invoice_number", "total_amount", "tax_amount", "subtotal"]:
+        for key in ["vendor_name", "tax_id", "invoice_date", "invoice_number", "total_before_vat", "vat_value", "total_after_vat"]:
             if not inv_data.get(key) and local_data.get(key):
                 inv_data[key] = local_data[key]
 
     inv_data["اسم_الملف"] = unit["filename"]
     inv_data["رقم_الصفحة"] = str(unit["page_num"])
-    audited = perform_full_audit(inv_data)
-    return [audited]
+    return [perform_full_audit(inv_data)]
 
 def export_to_multi_sheet_excel(raw_records: list, output_excel: str):
     df = pd.DataFrame(raw_records)
@@ -258,28 +239,25 @@ def export_to_multi_sheet_excel(raw_records: list, output_excel: str):
 
     df_summary = df.copy()
     df_summary["vendor_name"] = df_summary["vendor_name"].fillna("غير محدد").astype(str).str.strip()
-    df_summary["total_amount"] = pd.to_numeric(df_summary["total_amount"], errors="coerce").fillna(0.0)
-    df_summary["tax_amount"] = pd.to_numeric(df_summary["tax_amount"], errors="coerce").fillna(0.0)
-    df_summary["subtotal"] = pd.to_numeric(df_summary["subtotal"], errors="coerce").fillna(0.0)
-    df_summary["discount"] = pd.to_numeric(df_summary.get("discount", 0.0), errors="coerce").fillna(0.0)
+    df_summary["total_before_vat"] = pd.to_numeric(df_summary["total_before_vat"], errors="coerce").fillna(0.0)
+    df_summary["vat_value"] = pd.to_numeric(df_summary["vat_value"], errors="coerce").fillna(0.0)
+    df_summary["total_after_vat"] = pd.to_numeric(df_summary["total_after_vat"], errors="coerce").fillna(0.0)
 
     pivot_df = df_summary.groupby("vendor_name").agg(
         عدد_الفواتير=("invoice_number", "count"),
-        إجمالي_قبل_الضريبة=("subtotal", "sum"),
-        إجمالي_الخصم=("discount", "sum"),
-        إجمالي_الضريبة=("tax_amount", "sum"),
-        الإجمالي_الشامل=("total_amount", "sum")
+        Total_Invoice_Value_Before_VAT=("total_before_vat", "sum"),
+        VAT_Value_15_Percent=("vat_value", "sum"),
+        Total_Invoice_Value_After_VAT=("total_after_vat", "sum")
     ).reset_index()
 
-    pivot_df = pivot_df.sort_values(by="الإجمالي_الشامل", ascending=False)
+    pivot_df = pivot_df.sort_values(by="Total_Invoice_Value_After_VAT", ascending=False)
 
     total_row = pd.DataFrame({
         "vendor_name": ["الإجمالي العام"],
         "عدد_الفواتير": [pivot_df["عدد_الفواتير"].sum()],
-        "إجمالي_قبل_الضريبة": [pivot_df["إجمالي_قبل_الضريبة"].sum()],
-        "إجمالي_الخصم": [pivot_df["إجمالي_الخصم"].sum()],
-        "إجمالي_الضريبة": [pivot_df["إجمالي_الضريبة"].sum()],
-        "الإجمالي_الشامل": [pivot_df["الإجمالي_الشامل"].sum()]
+        "Total_Invoice_Value_Before_VAT": [pivot_df["Total_Invoice_Value_Before_VAT"].sum()],
+        "VAT_Value_15_Percent": [pivot_df["VAT_Value_15_Percent"].sum()],
+        "Total_Invoice_Value_After_VAT": [pivot_df["Total_Invoice_Value_After_VAT"].sum()]
     })
     pivot_df = pd.concat([pivot_df, total_row], ignore_index=True)
 
@@ -290,10 +268,9 @@ def export_to_multi_sheet_excel(raw_records: list, output_excel: str):
         "invoice_number": "رقم الفاتورة",
         "vendor_name": "اسم المورد / الفرع",
         "tax_id": "رقم التسجيل الضريبي",
-        "subtotal": "القيمة قبل الخصم",
-        "discount": "الخصم",
-        "tax_amount": "الضريبة",
-        "total_amount": "الإجمالي",
+        "total_before_vat": "Total Invoice Value Before VAT",
+        "vat_value": "VAT Value (15.0%)",
+        "total_after_vat": "Total Invoice Value After VAT",
         "calculated_total": "الإجمالي المحسوب",
         "difference": "الفروق",
         "audit_status": "التدقيق المحاسبي",
@@ -306,10 +283,9 @@ def export_to_multi_sheet_excel(raw_records: list, output_excel: str):
     summary_mapping = {
         "vendor_name": "اسم المورد / الفرع",
         "عدد_الفواتير": "عدد الفواتير",
-        "إجمالي_قبل_الضريبة": "إجمالي قبل الضريبة",
-        "إجمالي_الخصم": "إجمالي الخصم",
-        "إجمالي_الضريبة": "إجمالي ضريبة القيمة المضافة",
-        "الإجمالي_الشامل": "الإجمالي النهائي شامل الضريبة"
+        "Total_Invoice_Value_Before_VAT": "Total Invoice Value Before VAT",
+        "VAT_Value_15_Percent": "VAT Value (15.0%)",
+        "Total_Invoice_Value_After_VAT": "Total Invoice Value After VAT"
     }
     pivot_df = pivot_df.rename(columns=summary_mapping)
 
@@ -343,7 +319,7 @@ def export_to_multi_sheet_excel(raw_records: list, output_excel: str):
                 ws.column_dimensions[col_letter].width = max(max_len + 4, 15)
 
 st.title("🧾 نظام تحليل وفحص الفواتير الضريبية (AI + Local Engine)")
-st.markdown("ارفع فواتيرك (PDF أو صور) وسيقوم النظام باستخراج أسماء الفروع والمبالغ وتدقيقها محاسبياً وتصدير تقرير إكسيل احترافي بشيتين.")
+st.markdown("ارفع فواتيرك وسيخرج تقرير الإكسيل بالأعمدة المطلوبة تماماً: Before VAT، VAT Value، وAfter VAT.")
 
 api_key = ""
 try:
