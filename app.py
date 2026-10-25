@@ -2,12 +2,12 @@ import os
 import re
 import json
 import base64
+import urllib.request
+import urllib.error
 import fitz  # PyMuPDF
 import cv2
 import numpy as np
 import pandas as pd
-from typing import List, Optional
-import google.generativeai as genai
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 from openpyxl.styles import PatternFill, Font, Alignment
@@ -15,14 +15,15 @@ from openpyxl.styles import PatternFill, Font, Alignment
 st.set_page_config(page_title="نظام تدقيق وتحليل الفواتير الضريبية", page_icon="🧾", layout="wide")
 
 # ==========================================
-# نظام حماية بكلمة المرور للمحاسبين
+# 1. نظام حماية بكلمة المرور للمحاسبين
 # ==========================================
 def check_password():
-    correct_password = ""
+    correct_password = "Finyx2026"
     try:
-        correct_password = st.secrets.get("APP_PASSWORD", "Finyx2026")
+        if "APP_PASSWORD" in st.secrets:
+            correct_password = st.secrets["APP_PASSWORD"]
     except Exception:
-        correct_password = "Finyx2026"
+        pass
 
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
@@ -48,30 +49,7 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# الكشف التلقائي عن أحدث موديل متاح في حسابك
-# ==========================================
-@st.cache_resource
-def get_working_model_name(api_key_str: str) -> str:
-    genai.configure(api_key=api_key_str)
-    try:
-        available_models = [
-            m.name for m in genai.list_models() 
-            if "generateContent" in m.supported_generation_methods
-        ]
-        # ترتيب الأولوية لأحدث وأسرع النماذج التي تدعم الصور والنصوص
-        preferred_keywords = ["2.5-flash", "2.0-flash", "flash", "pro"]
-        for keyword in preferred_keywords:
-            for model_name in available_models:
-                if keyword in model_name.lower() and "vision" not in model_name.lower():
-                    return model_name
-        if available_models:
-            return available_models[0]
-    except Exception:
-        pass
-    return "models/gemini-2.5-flash"
-
-# ==========================================
-# دوال تحليل QR والتدقيق المحاسبي
+# 2. محرك قراءة QR الفاتورة الإلكترونية (ZATCA)
 # ==========================================
 TOLERANCE = 0.05
 
@@ -92,9 +70,9 @@ def decode_tlv_base64(b64_string: str) -> dict:
         return {
             "qr_vendor": tlv_data.get(1, ""),
             "qr_tax_id": tlv_data.get(2, ""),
-            "qr_date": tlv_data.get(3, ""),
-            "qr_total": float(tlv_data.get(4, 0.0) or 0.0),
-            "qr_tax": float(tlv_data.get(5, 0.0) or 0.0),
+            "qr_date": tlv_data.get(3, "")[:10],
+            "qr_total": float(re.sub(r"[^\d.]", "", tlv_data.get(4, "0")) or 0.0),
+            "qr_tax": float(re.sub(r"[^\d.]", "", tlv_data.get(5, "0")) or 0.0),
         }
     except Exception:
         return None
@@ -103,20 +81,180 @@ def extract_qr_from_image(img_bgr) -> dict:
     if img_bgr is None:
         return None
     detector = cv2.QRCodeDetector()
-    for scale in [1.0, 1.5, 0.75]:
-        resized = cv2.resize(img_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC) if scale != 1.0 else img_bgr
-        data, _, _ = detector.detectAndDecode(resized)
-        if data:
-            decoded_tlv = decode_tlv_base64(data)
-            if decoded_tlv:
-                return decoded_tlv
-            return {"qr_raw": data, "qr_total": None, "qr_tax": None, "qr_tax_id": ""}
+    for scale in [1.0, 1.5, 2.0, 0.75]:
+        try:
+            resized = cv2.resize(img_bgr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC) if scale != 1.0 else img_bgr
+            data, _, _ = detector.detectAndDecode(resized)
+            if not data:
+                gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+                _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+                data, _, _ = detector.detectAndDecode(thresh)
+            if data:
+                decoded_tlv = decode_tlv_base64(data)
+                if decoded_tlv:
+                    return decoded_tlv
+                return {"qr_raw": data, "qr_total": None, "qr_tax": None, "qr_tax_id": ""}
+        except Exception:
+            continue
     return None
 
-def perform_full_audit(data: dict, qr_info: dict = None) -> dict:
-    if qr_info is None:
-        qr_info = data.get("_qr_info")
+# ==========================================
+# 3. محرك الاستخراج المحلي الذكي (Regex + QR)
+# ==========================================
+def local_regex_extract(text: str, filename: str, qr_info: dict = None) -> dict:
+    data = {
+        "invoice_date": "",
+        "invoice_number": "",
+        "vendor_name": "",
+        "tax_id": "",
+        "subtotal": 0.0,
+        "discount": 0.0,
+        "tax_amount": 0.0,
+        "total_amount": 0.0
+    }
 
+    if qr_info and qr_info.get("qr_total") is not None:
+        data["vendor_name"] = qr_info.get("qr_vendor", "")
+        data["tax_id"] = qr_info.get("qr_tax_id", "")
+        data["invoice_date"] = qr_info.get("qr_date", "")
+        data["total_amount"] = round(float(qr_info.get("qr_total", 0.0)), 2)
+        data["tax_amount"] = round(float(qr_info.get("qr_tax", 0.0)), 2)
+        if data["total_amount"] > 0:
+            data["subtotal"] = round(data["total_amount"] - data["tax_amount"], 2)
+
+    if not text:
+        return data
+
+    if not data["tax_id"]:
+        tax_match = re.search(r'\b(3\d{13}3|\d{3}-\d{3}-\d{3}|\d{15})\b', text)
+        if tax_match:
+            data["tax_id"] = tax_match.group(1)
+
+    if not data["invoice_date"]:
+        date_match = re.search(r'(\d{4}[-/]\d{2}[-/]\d{2}|\d{2}[-/]\d{2}[-/]\d{4})', text)
+        if date_match:
+            data["invoice_date"] = date_match.group(1)
+        else:
+            fname_date = re.search(r'(202\d)(\d{2})(\d{2})', filename)
+            if fname_date:
+                data["invoice_date"] = f"{fname_date.group(1)}-{fname_date.group(2)}-{fname_date.group(3)}"
+
+    inv_match = re.search(r'(?:Invoice\s*(?:No|Number|#)|رقم\s*الفاتورة|فاتورة\s*رقم)[\s:.\-#]*([A-Za-z0-9\-/]+)', text, re.IGNORECASE)
+    if inv_match:
+        data["invoice_number"] = inv_match.group(1).strip()
+
+    if not data["vendor_name"]:
+        lines = [line.strip() for line in text.split('\n') if len(line.strip()) > 3]
+        for line in lines[:6]:
+            if any(w in line for w in ["شركة", "مؤسسة", "Company", "LLC", "Co.", "Burger", "برجر"]):
+                data["vendor_name"] = line
+                break
+        if not data["vendor_name"]:
+            clean_fname = re.sub(r'\.pdf$|\.jpg$|\.png$', '', filename, flags=re.IGNORECASE)
+            data["vendor_name"] = clean_fname.split('_')[0].strip()
+
+    if data["total_amount"] == 0.0:
+        amounts = re.findall(r'\b\d{1,3}(?:,\d{3})*\.\d{2}\b', text)
+        float_amounts = sorted(list(set([float(a.replace(',', '')) for a in amounts if float(a.replace(',', '')) > 0])))
+        if len(float_amounts) >= 2:
+            for total_cand in reversed(float_amounts):
+                for sub_cand in float_amounts:
+                    if sub_cand < total_cand:
+                        diff_tax = round(total_cand - sub_cand, 2)
+                        if abs(diff_tax - round(sub_cand * 0.15, 2)) <= 0.5 or abs(diff_tax - round(sub_cand * 0.14, 2)) <= 0.5 or diff_tax in float_amounts:
+                            data["total_amount"] = total_cand
+                            data["subtotal"] = sub_cand
+                            data["tax_amount"] = diff_tax
+                            break
+                if data["total_amount"] > 0:
+                    break
+        elif len(float_amounts) == 1:
+            data["total_amount"] = float_amounts[0]
+            data["subtotal"] = round(float_amounts[0] / 1.15, 2)
+            data["tax_amount"] = round(data["total_amount"] - data["subtotal"], 2)
+
+    return data
+
+# ==========================================
+# 4. اتصال مباشر بـ Gemini باستخدام urllib المدمجة
+# ==========================================
+def http_get_json(url: str, timeout: int = 10) -> dict:
+    req = urllib.request.Request(url, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+def http_post_json(url: str, payload: dict, timeout: int = 25) -> dict:
+    data_bytes = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data_bytes, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+def call_gemini_rest_api(api_key: str, img_bytes: bytes, text_content: str) -> dict:
+    api_key = api_key.strip()
+    b64_img = base64.b64encode(img_bytes).decode("utf-8")
+
+    models_to_try = []
+    try:
+        list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
+        res_json = http_get_json(list_url, timeout=10)
+        for m in res_json.get("models", []):
+            if "generateContent" in m.get("supportedGenerationMethods", []):
+                m_name = m["name"].replace("models/", "")
+                if any(k in m_name for k in ["2.5-flash", "2.0-flash", "flash", "pro"]) and "vision" not in m_name:
+                    models_to_try.append(m_name)
+    except Exception:
+        pass
+
+    for fallback_m in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
+        if fallback_m not in models_to_try:
+            models_to_try.append(fallback_m)
+
+    prompt = f"""
+    أنت مدقق فواتير ضريبية خبير. استخرج بيانات الفاتورة التالية وأرجع النتيجة بصيغة JSON فقط يحتوي على هذه المفاتيح:
+    {{
+      "invoice_date": "YYYY-MM-DD",
+      "invoice_number": "رقم الفاتورة",
+      "vendor_name": "اسم الشركة أو المورد",
+      "tax_id": "الرقم الضريبي",
+      "subtotal": 0.0,
+      "discount": 0.0,
+      "tax_amount": 0.0,
+      "total_amount": 0.0
+    }}
+    النص المساعد المستخرج من الملف:
+    {text_content[:3000] if text_content else "لا يوجد نص، اقرأ من الصورة المرفقة"}
+    """
+
+    payload = {
+        "contents": [{
+            "parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64_img}}
+            ]
+        }],
+        "generationConfig": {"temperature": 0.0}
+    }
+
+    last_error = ""
+    for model_name in models_to_try:
+        for version in ["v1beta", "v1"]:
+            url = f"https://generativelanguage.googleapis.com/{version}/models/{model_name}:generateContent?key={api_key}"
+            try:
+                resp_json = http_post_json(url, payload, timeout=25)
+                raw_text = resp_json["candidates"][0]["content"]["parts"][0]["text"]
+                json_match = re.search(r'(\{.*\}|\[.*\])', raw_text, re.DOTALL)
+                if json_match:
+                    parsed = json.loads(json_match.group(1))
+                    return parsed[0] if isinstance(parsed, list) else parsed
+            except Exception as e:
+                last_error = str(e)
+
+    raise RuntimeError(last_error)
+
+# ==========================================
+# 5. التدقيق المحاسبي ومعالجة الملفات
+# ==========================================
+def perform_full_audit(data: dict, qr_info: dict = None) -> dict:
     subtotal = float(data.get("subtotal") or 0.0)
     discount = float(data.get("discount") or 0.0)
     tax = float(data.get("tax_amount") or 0.0)
@@ -128,7 +266,7 @@ def perform_full_audit(data: dict, qr_info: dict = None) -> dict:
     data["difference"] = diff
 
     if extracted_total == 0 and subtotal == 0:
-        data["audit_status"] = "⚠️ خطأ: القيم صفرية"
+        data["audit_status"] = "⚠️ القيم صفرية (تحتاج مراجعة)"
     elif abs(diff) <= TOLERANCE:
         data["audit_status"] = "✓ مطابق حسابياً"
     else:
@@ -150,7 +288,7 @@ def perform_full_audit(data: dict, qr_info: dict = None) -> dict:
         if total_match and tax_match:
             data["qr_match_status"] = "✓ مطابق للـ QR (100%)"
         else:
-            data["qr_match_status"] = "❌ اختلاف مع الـ QR"
+            data["qr_match_status"] = f"❌ اختلاف مع QR ({qr_total})"
     else:
         data["qr_total"] = ""
         data["qr_tax"] = ""
@@ -166,9 +304,9 @@ def process_file_bytes(file_bytes, filename, split_pages):
             doc = fitz.open(stream=file_bytes, filetype="pdf")
             for page_idx in range(len(doc)):
                 page = doc[page_idx]
-                text_content = page.get_text()
+                text_content = page.get_text("text")
                 
-                pix = page.get_pixmap(dpi=150)
+                pix = page.get_pixmap(dpi=180)
                 img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
                 img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR if pix.n == 3 else cv2.COLOR_RGBA2BGR)
                 _, buffer = cv2.imencode(".jpg", img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
@@ -195,69 +333,29 @@ def process_file_bytes(file_bytes, filename, split_pages):
         st.error(f"خطأ في قراءة الملف {filename}: {e}")
     return units
 
-def analyze_unit(unit, active_model_name):
+def analyze_unit(unit, api_key: str):
     qr_info = extract_qr_from_image(unit["img_bgr"])
-    model = genai.GenerativeModel(active_model_name)
     
-    text_hint = f"\nالنص المستخرج من الصفحة للاستعانة به:\n{unit['text_content']}" if unit.get("text_content") else ""
+    inv_data = None
+    if api_key:
+        try:
+            inv_data = call_gemini_rest_api(api_key, unit["img_bytes"], unit.get("text_content", ""))
+        except Exception:
+            inv_data = None
+
+    local_data = local_regex_extract(unit.get("text_content", ""), unit["filename"], qr_info)
     
-    prompt = f"""
-    أنت محاسب خبير ومدقق فواتير ضريبية. قم بتحليل صورة الفاتورة المرفقة (والنص المرفق إن وجد) واستخرج البيانات بدقة على شكل كائن JSON صحيح يحتوي على المفاتيح الآتية فقط:
-    {{
-      "invoice_date": "تاريخ الفاتورة بصيغة YYYY-MM-DD",
-      "invoice_number": "رقم الفاتورة",
-      "vendor_name": "اسم المورد أو الشركة",
-      "tax_id": "رقم التسجيل الضريبي إن وجد",
-      "subtotal": 0.0,
-      "discount": 0.0,
-      "tax_amount": 0.0,
-      "total_amount": 0.0
-    }}
-    إذا لم تجد قيمة لحقل رقمي ضع 0.0، وإذا لم تجد نصاً ضع "". أجب بـ JSON فقط بدون أي نص إضافي.
-    {text_hint}
-    """
+    if not inv_data or (float(inv_data.get("total_amount") or 0) == 0 and local_data["total_amount"] > 0):
+        inv_data = local_data
+    else:
+        for key in ["vendor_name", "tax_id", "invoice_date", "invoice_number"]:
+            if not inv_data.get(key) and local_data.get(key):
+                inv_data[key] = local_data[key]
 
-    contents = [{"mime_type": "image/jpeg", "data": unit["img_bytes"]}, prompt]
-
-    try:
-        response = model.generate_content(contents)
-        
-        if not response.text:
-            return []
-
-        text_res = response.text.strip()
-        # استخراج كائن JSON بنجاح حتى لو وجد نص حوله
-        json_match = re.search(r'(\{.*\}|\[.*\])', text_res, re.DOTALL)
-        if json_match:
-            text_res = json_match.group(1)
-            
-        parsed_data = json.loads(text_res.strip())
-        invoices_list = parsed_data if isinstance(parsed_data, list) else [parsed_data]
-        
-        results = []
-        for inv in invoices_list:
-            inv["اسم_الملف"] = unit["filename"]
-            inv["رقم_الصفحة"] = str(unit["page_num"])
-            audited = perform_full_audit(inv, qr_info if len(invoices_list) == 1 else None)
-            results.append(audited)
-        return results
-    except Exception as e:
-        return [{
-            "اسم_الملف": unit["filename"],
-            "رقم_الصفحة": str(unit["page_num"]),
-            "invoice_date": "-",
-            "invoice_number": "-",
-            "vendor_name": f"خطأ معالجة: {str(e)}",
-            "tax_id": "-",
-            "subtotal": 0.0,
-            "discount": 0.0,
-            "tax_amount": 0.0,
-            "total_amount": 0.0,
-            "calculated_total": 0.0,
-            "difference": 0.0,
-            "audit_status": "❌ خطأ في القراءة",
-            "qr_match_status": "⚪ بدون QR"
-        }]
+    inv_data["اسم_الملف"] = unit["filename"]
+    inv_data["رقم_الصفحة"] = str(unit["page_num"])
+    audited = perform_full_audit(inv_data, qr_info)
+    return [audited]
 
 def export_to_multi_sheet_excel(raw_records: list, output_excel: str):
     df = pd.DataFrame(raw_records)
@@ -352,9 +450,9 @@ def export_to_multi_sheet_excel(raw_records: list, output_excel: str):
                 ws.column_dimensions[col_letter].width = max(max_len + 4, 15)
 
 # ==========================================
-# واجهة المستخدم عبر Streamlit
+# 6. واجهة المستخدم عبر Streamlit
 # ==========================================
-st.title("🧾 نظام تحليل وفحص الفواتير الضريبية (AI + QR)")
+st.title("🧾 نظام تحليل وفحص الفواتير الضريبية (AI + QR + Local Engine)")
 st.markdown("ارفع فواتيرك (PDF أو صور) وسيقوم النظام باستخراج البيانات وتدقيقها محاسبياً وتصدير تقرير إكسيل احترافي بشيتين.")
 
 api_key = ""
@@ -367,22 +465,18 @@ except Exception:
 with st.sidebar:
     st.header("⚙️ الإعدادات")
     if not api_key:
-        api_key_input = st.text_input("Gemini API Key", type="password")
+        api_key_input = st.text_input("Gemini API Key (اختياري مع المحرك المحلي)", type="password")
         if api_key_input:
             api_key = api_key_input
     else:
-        st.success("✓ تم تحميل مفتاح API بنجاح من أسرار المنصة")
+        st.success("✓ تم تحميل مفتاح API بنجاح")
 
     split_pdf = st.checkbox("تقسيم صفحات الـ PDF المدمجة", value=True)
     max_workers = st.slider("عدد المسارات المتوازية", 1, 15, 5)
 
 uploaded_files = st.file_uploader("اختر ملفات الفواتير (PDF أو صور)", accept_multiple_files=True, type=["pdf", "png", "jpg", "jpeg", "webp"])
 
-if uploaded_files and api_key:
-    genai.configure(api_key=api_key)
-    active_model = get_working_model_name(api_key)
-    st.sidebar.info(f"🤖 الموديل النشط: `{active_model}`")
-
+if uploaded_files:
     if st.button("🚀 بدء التحليل والفحص الشامل", type="primary"):
         all_units = []
         for file in uploaded_files:
@@ -397,7 +491,7 @@ if uploaded_files and api_key:
         total = len(all_units)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_unit = {executor.submit(analyze_unit, u, active_model): u for u in all_units}
+            future_to_unit = {executor.submit(analyze_unit, u, api_key): u for u in all_units}
             for future in as_completed(future_to_unit):
                 res = future.result()
                 if res:
@@ -407,7 +501,7 @@ if uploaded_files and api_key:
                 status_text.text(f"جاري معالجة الصفحة {completed} من {total}...")
 
         if raw_results:
-            st.success(f"🎉 تمت المعالجة بنجاح واستخلاص البيانات لـ {len(raw_results)} وحدة!")
+            st.success(f"🎉 تمت المعالجة بنجاح واستخلاص البيانات لـ {len(raw_results)} صفحة!")
             
             output_excel = "invoices_summary.xlsx"
             export_to_multi_sheet_excel(raw_results, output_excel)
@@ -422,7 +516,3 @@ if uploaded_files and api_key:
             
             with st.expander("عرض السجل التفصيلي للفواتير المستخرجة", expanded=True):
                 st.dataframe(pd.DataFrame(raw_results), use_container_width=True)
-        else:
-            st.warning("لم يتم استخراج أي بيانات. يرجى التأكد من وضوح الفواتير المرفوعة.")
-elif uploaded_files and not api_key:
-    st.error("يرجى إدخال مفتاح الـ API في الشريط الجانبي أو إعداده في الـ Secrets.")
