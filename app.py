@@ -13,7 +13,6 @@ import urllib.error
 from datetime import datetime
 import pandas as pd
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import fitz  # PyMuPDF
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
@@ -123,7 +122,7 @@ def save_vendor_to_db(tax_id: str, vendor_name: str):
             pass
 
 # ==========================================
-# 3. محرك فك التشفير وزوم الـ QR Code (ZATCA TLV)
+# 3. محرك فك التشفير وزوم الـ QR Code (ZATCA TLV) المحسن
 # ==========================================
 def decode_tlv_base64(b64_string: str) -> dict:
     try:
@@ -177,7 +176,9 @@ def try_decode_cv2_qr(img_bgr) -> dict:
         for _, reg in regions:
             if reg.size == 0:
                 continue
-            gray = cv2.cvtColor(reg, cv2.COLOR_BGR2GRAY)
+            # إضافة حدود بيضاء وحماية لـ QR الملتصق بالحواف
+            bordered = cv2.copyMakeBorder(reg, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=[255, 255, 255])
+            gray = cv2.cvtColor(bordered, cv2.COLOR_BGR2GRAY)
             for zoom in [1.0, 1.5, 2.0]:
                 try:
                     resized = cv2.resize(gray, None, fx=zoom, fy=zoom, interpolation=cv2.INTER_CUBIC) if zoom != 1.0 else gray
@@ -201,7 +202,8 @@ def try_decode_cv2_qr(img_bgr) -> dict:
 def scan_pdf_for_qr(doc) -> dict:
     if not HAS_CV2:
         return None
-    for p_idx in range(min(len(doc), 2)):
+    # فحص جميع الصفحات أو أول صفحتين لتغطية الفواتير الكبيرة مثل هنجرستيشن
+    for p_idx in range(min(len(doc), 3)):
         page = doc[p_idx]
         try:
             for img_info in page.get_images(full=True):
@@ -210,7 +212,7 @@ def scan_pdf_for_qr(doc) -> dict:
                 img_bytes = base_img["image"]
                 img_np = np.frombuffer(img_bytes, np.uint8)
                 img_bgr = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
-                if img_bgr is not None and img_bgr.shape[0] > 20 and img_bgr.shape[1] > 20:
+                if img_bgr is not None and img_bgr.shape[0] > 15 and img_bgr.shape[1] > 15:
                     res = try_decode_cv2_qr(img_bgr)
                     if res:
                         return res
@@ -283,17 +285,18 @@ def extract_invoice_date(text: str, filename: str, qr_info: dict = None) -> str:
 
 def extract_invoice_number(text: str, filename: str) -> str:
     inv_patterns = [
+        r'(HS-\d{4}/\d+-\d+)',
         r'(PSI/\d{4}/\d+)',
         r'(SA-B2B-INV-\d+)',
         r'(SINV\d+)',
-        r'(HS-(?:CPC-|ADS-)?\d{4}/\d+-\d+)',
         r'(INV/\d{4}/\d{2}/\d+)',
         r'(INV/\d{4}/\d+)',
         r'(SCR\d+)',
+        r'(\d{13})',  # نمط أرقام فواتير أفضل الطهاة (The Chefz) الطويلة
         r'Invoice\s*(?:No\.?|Number|#)\s*[:\|]?\s*([A-Za-z0-9\-/]+)',
         r'رقم\s+الفاتورة\s*[:\|]?\s*([A-Za-z0-9\-/]+)',
-        r'INVOICE\s+(\d{3,12})\b',
-        r'Document\s*Number[\s\S]{1,30}?(\d{5,12})\b',
+        r'INVOICE\s+(\d{3,15})\b',
+        r'Document\s*Number[\s\S]{1,30}?(\d{5,15})\b',
     ]
     for pat in inv_patterns:
         m = re.search(pat, text, re.IGNORECASE)
@@ -303,12 +306,13 @@ def extract_invoice_number(text: str, filename: str) -> str:
                 return cand
 
     fname_patterns = [
+        r'(HS-[A-Za-z0-9\-/]+)',
         r'(PSI[_/]\d{4}[_/]\d+)',
         r'(INV[_/]\d{4}[_/]\d+)',
         r'(SA-B2B-INV-\d+)',
         r'(SINV\d+)',
         r'(SCR\d+)',
-        r'(\d{6,10})',
+        r'(\d{6,15})',
     ]
     for pat in fname_patterns:
         m = re.search(pat, filename, re.IGNORECASE)
@@ -326,9 +330,15 @@ def extract_amounts(text: str, qr_info: dict = None) -> tuple:
         tb = round(ta - vat, 2)
         return (tb, vat, ta)
 
-    tb_m = re.search(r'(?:Total\s+Before\s+Tax|Total\s+Excl\.\s+VAT|SUBTOTAL|الإجمالي\s+الفرعي)[\s:.\-\|SRSAR]*([\d,]+\.\d{1,2})', text, re.IGNORECASE)
+    # أنماط مخصصة لفواتير هنجرستيشن وتويو وأفضل الطهاة
+    hs_ta = re.search(r'(?:Total\s+Invoice\s+After\s+VAT|Net\s+Due\s+Invoice|Net\s+Monthly\s+Due\s+Balance|Total\s+Payable|Total\s+Invoice)\s*[:\|]?\s*([\d,]+\.\d{1,2})', text, re.IGNORECASE)
+    if hs_ta:
+        # البحث عن الضرائب في النص
+        pass
+
+    tb_m = re.search(r'(?:Total\s+Before\s+Tax|Total\s+Excl\.\s+VAT|SUBTOTAL|الإجمالي\s+الفرعي|المبلغ\s+بدون\s+ضريبة)[\s:.\-\|SRSAR]*([\d,]+\.\d{1,2})', text, re.IGNORECASE)
     vat_m = re.search(r'(?:VAT\s*15\.?0?%|Total\s+VAT|ضريبة\s+القيمة\s+المضافة)[\s:.\-\|SRSAR]*([\d,]+\.\d{1,2})', text, re.IGNORECASE)
-    ta_m = re.search(r'(?:Total\s+Amount\s+Due|Grand\s+Total|TOTAL|الإجمالي\s+الشامل)[\s:.\-\|SRSAR]*([\d,]+\.\d{1,2})', text, re.IGNORECASE)
+    ta_m = re.search(r'(?:Total\s+Invoice\s+After\s+VAT|Total\s+Amount\s+Due|Grand\s+Total|TOTAL|الإجمالي\s+الشامل|إجمالي\s+المستحقات)[\s:.\-\|SRSAR]*([\d,]+\.\d{1,2})', text, re.IGNORECASE)
 
     if tb_m:
         tb = float(tb_m.group(1).replace(',', ''))
