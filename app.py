@@ -13,6 +13,7 @@ import urllib.error
 from datetime import datetime
 import pandas as pd
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import fitz  # PyMuPDF
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
@@ -176,7 +177,6 @@ def try_decode_cv2_qr(img_bgr) -> dict:
         for _, reg in regions:
             if reg.size == 0:
                 continue
-            # إضافة حدود بيضاء وحماية لـ QR الملتصق بالحواف
             bordered = cv2.copyMakeBorder(reg, 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=[255, 255, 255])
             gray = cv2.cvtColor(bordered, cv2.COLOR_BGR2GRAY)
             for zoom in [1.0, 1.5, 2.0]:
@@ -202,7 +202,6 @@ def try_decode_cv2_qr(img_bgr) -> dict:
 def scan_pdf_for_qr(doc) -> dict:
     if not HAS_CV2:
         return None
-    # فحص جميع الصفحات أو أول صفحتين لتغطية الفواتير الكبيرة مثل هنجرستيشن
     for p_idx in range(min(len(doc), 3)):
         page = doc[p_idx]
         try:
@@ -292,7 +291,7 @@ def extract_invoice_number(text: str, filename: str) -> str:
         r'(INV/\d{4}/\d{2}/\d+)',
         r'(INV/\d{4}/\d+)',
         r'(SCR\d+)',
-        r'(\d{13})',  # نمط أرقام فواتير أفضل الطهاة (The Chefz) الطويلة
+        r'(\d{13})',
         r'Invoice\s*(?:No\.?|Number|#)\s*[:\|]?\s*([A-Za-z0-9\-/]+)',
         r'رقم\s+الفاتورة\s*[:\|]?\s*([A-Za-z0-9\-/]+)',
         r'INVOICE\s+(\d{3,15})\b',
@@ -329,12 +328,6 @@ def extract_amounts(text: str, qr_info: dict = None) -> tuple:
         vat = round(float(qr_info["qr_tax"]), 2)
         tb = round(ta - vat, 2)
         return (tb, vat, ta)
-
-    # أنماط مخصصة لفواتير هنجرستيشن وتويو وأفضل الطهاة
-    hs_ta = re.search(r'(?:Total\s+Invoice\s+After\s+VAT|Net\s+Due\s+Invoice|Net\s+Monthly\s+Due\s+Balance|Total\s+Payable|Total\s+Invoice)\s*[:\|]?\s*([\d,]+\.\d{1,2})', text, re.IGNORECASE)
-    if hs_ta:
-        # البحث عن الضرائب في النص
-        pass
 
     tb_m = re.search(r'(?:Total\s+Before\s+Tax|Total\s+Excl\.\s+VAT|SUBTOTAL|الإجمالي\s+الفرعي|المبلغ\s+بدون\s+ضريبة)[\s:.\-\|SRSAR]*([\d,]+\.\d{1,2})', text, re.IGNORECASE)
     vat_m = re.search(r'(?:VAT\s*15\.?0?%|Total\s+VAT|ضريبة\s+القيمة\s+المضافة)[\s:.\-\|SRSAR]*([\d,]+\.\d{1,2})', text, re.IGNORECASE)
@@ -473,10 +466,10 @@ def perform_audit_and_qr_match(data: dict, qr_info: dict = None) -> dict:
     return data
 
 # ==========================================
-# 7. معالجة المستندات الآمنة (Disk-Streaming)
+# 7. المعالجة السريعة والمتوازية للمستندات (Turbo Parallel Processing)
 # ==========================================
-def process_task_from_disk(task_info: tuple, display_name: str) -> list:
-    task_type, path_or_zip, internal_name = task_info
+def process_single_file_task(task_info: tuple) -> list:
+    task_type, path_or_zip, internal_name, display_name = task_info
     try:
         if task_type == "zip":
             with zipfile.ZipFile(path_or_zip, "r") as zf:
@@ -727,6 +720,10 @@ def export_to_excel(records: list, output_path: str):
 st.title("🧾 نظام تحليل المشتريات والفرز الضريبي (ZATCA)")
 st.markdown("يجمع **الفواتير الضريبية والإشعارات المدينة** في الشيت الأول، ويفصل **الإشعارات الدائنة فقط** في شيت مستقل، مع **تلوين الأرقام المكررة بالأصفر الفاتح**.")
 
+with st.sidebar:
+    st.header("⚙️ إعدادات الأداء السريع")
+    max_workers = st.slider("عدد المسارات المتوازية (Workers)", 2, 16, 8)
+
 uploaded_files = st.file_uploader(
     "ارفع ملف ZIP أو ملفات الفواتير (PDF / صور)",
     accept_multiple_files=True,
@@ -734,12 +731,12 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    if st.button("🚀 بدء التحليل والفرز الضريبي الشامل", type="primary"):
+    if st.button("🚀 بدء التحليل والفرز الضريبي الشامل (فائق السرعة)", type="primary"):
         temp_dir = tempfile.mkdtemp()
         task_queue = []
         valid_exts = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
 
-        with st.spinner("جاري فهرسة الملفات على القرص المؤقت..."):
+        with st.spinner("جاري فك وفهرسة الملفات بسرعة فائقة..."):
             for idx, uf in enumerate(uploaded_files):
                 fname = uf.name
                 temp_path = os.path.join(temp_dir, f"upload_{idx}_{os.path.basename(fname)}")
@@ -760,7 +757,7 @@ if uploaded_files:
                     task_queue.append(("file", temp_path, "", fname))
 
         total_files = len(task_queue)
-        st.info(f"📂 تم تجهيز **{total_files}** مستند. جاري الفحص...")
+        st.info(f"📂 تم تجهيز **{total_files}** مستند. جاري التحليل بالتوازي...")
 
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -768,18 +765,23 @@ if uploaded_files:
         raw_results = []
         completed = 0
 
-        for t_info in task_queue:
-            if t_info[0] == "zip":
-                res = process_task_from_disk(("zip", t_info[1], t_info[2]), t_info[3])
-            else:
-                res = process_task_from_disk(("file", t_info[1], ""), t_info[3])
-            
-            if res:
-                raw_results.extend(res)
-            
-            completed += 1
-            progress_bar.progress(completed / max(total_files, 1))
-            status_text.text(f"⏳ تم فحص وفرز {completed} من أصل {total_files} مستند ({int((completed/max(total_files,1))*100)}%)...")
+        # التشغيل المتوازي السريع (Parallel Execution) مع الحفاظ على الدقة الكاملة
+        BATCH_SIZE = 50
+        for batch_start in range(0, total_files, BATCH_SIZE):
+            batch = task_queue[batch_start : batch_start + BATCH_SIZE]
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(process_single_file_task, t_info)
+                    for t_info in batch
+                ]
+                for future in as_completed(futures):
+                    res = future.result()
+                    if res:
+                        raw_results.extend(res)
+                    completed += 1
+                    if completed % 5 == 0 or completed == total_files:
+                        progress_bar.progress(completed / max(total_files, 1))
+                        status_text.text(f"⏳ تم فحص وفرز {completed} من أصل {total_files} مستند ({int((completed/max(total_files,1))*100)}%)...")
             gc.collect()
 
         st.session_state["last_audit_results"] = raw_results
