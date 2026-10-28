@@ -58,7 +58,7 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 2. ثوابت ونظام الذاكرة الديناميكية للموردين (دعم الموردين الجدد بأمان)
+# 2. ثوابت ونظام الذاكرة الديناميكية للموردين
 # ==========================================
 TOLERANCE = 0.05
 CUSTOMER_VAT_NUMBERS = {"313066974700003"}
@@ -162,43 +162,45 @@ def decode_tlv_base64(b64_string: str) -> dict:
 def try_decode_cv2_qr(img_bgr, fast_mode=False) -> dict:
     if not HAS_CV2 or img_bgr is None:
         return None
-    detector = cv2.QRCodeDetector()
-    h, w = img_bgr.shape[:2]
+    try:
+        detector = cv2.QRCodeDetector()
+        h, w = img_bgr.shape[:2]
 
-    regions = [
-        ("full", img_bgr),
-        ("top_left", img_bgr[0:int(h*0.48), 0:int(w*0.48)]),
-        ("top_right", img_bgr[0:int(h*0.48), int(w*0.52):w]),
-        ("bottom_left", img_bgr[int(h*0.52):h, 0:int(w*0.48)]),
-        ("bottom_right", img_bgr[int(h*0.52):h, int(w*0.52):w]),
-    ]
+        regions = [
+            ("full", img_bgr),
+            ("top_left", img_bgr[0:int(h*0.48), 0:int(w*0.48)]),
+            ("top_right", img_bgr[0:int(h*0.48), int(w*0.52):w]),
+            ("bottom_left", img_bgr[int(h*0.52):h, 0:int(w*0.48)]),
+            ("bottom_right", img_bgr[int(h*0.52):h, int(w*0.52):w]),
+        ]
 
-    zoom_levels = [1.0, 1.6, 2.2] if fast_mode else [1.0, 1.5, 2.0, 2.5]
+        zoom_levels = [1.0, 1.6] if fast_mode else [1.0, 1.5, 2.0]
 
-    for _, reg in regions:
-        if reg.size == 0:
-            continue
-        bordered = cv2.copyMakeBorder(reg, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=[255, 255, 255])
-        gray = cv2.cvtColor(bordered, cv2.COLOR_BGR2GRAY)
-
-        for zoom in zoom_levels:
-            try:
-                resized = cv2.resize(gray, None, fx=zoom, fy=zoom, interpolation=cv2.INTER_CUBIC) if zoom != 1.0 else gray
-                thresholds = [
-                    resized,
-                    cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
-                    cv2.threshold(resized, 135, 255, cv2.THRESH_BINARY)[1],
-                    cv2.adaptiveThreshold(resized, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-                ]
-                for t_img in thresholds:
-                    data, _, _ = detector.detectAndDecode(t_img)
-                    if data:
-                        tlv = decode_tlv_base64(data)
-                        if tlv:
-                            return tlv
-                        return {"qr_raw": data, "qr_total": None, "qr_tax": None, "qr_tax_id": ""}
-            except Exception:
+        for _, reg in regions:
+            if reg.size == 0:
                 continue
+            bordered = cv2.copyMakeBorder(reg, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=[255, 255, 255])
+            gray = cv2.cvtColor(bordered, cv2.COLOR_BGR2GRAY)
+
+            for zoom in zoom_levels:
+                try:
+                    resized = cv2.resize(gray, None, fx=zoom, fy=zoom, interpolation=cv2.INTER_CUBIC) if zoom != 1.0 else gray
+                    thresholds = [
+                        resized,
+                        cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1],
+                        cv2.threshold(resized, 135, 255, cv2.THRESH_BINARY)[1]
+                    ]
+                    for t_img in thresholds:
+                        data, _, _ = detector.detectAndDecode(t_img)
+                        if data:
+                            tlv = decode_tlv_base64(data)
+                            if tlv:
+                                return tlv
+                            return {"qr_raw": data, "qr_total": None, "qr_tax": None, "qr_tax_id": ""}
+                except Exception:
+                    continue
+    except Exception:
+        pass
     return None
 
 def scan_pdf_for_qr(doc, max_pages_to_scan=3, fast_mode=False) -> dict:
@@ -209,7 +211,6 @@ def scan_pdf_for_qr(doc, max_pages_to_scan=3, fast_mode=False) -> dict:
     if len(doc) > max_pages_to_scan and (len(doc) - 1) not in pages_idx:
         pages_idx.append(len(doc) - 1)
 
-    # 1. فحص الصور المدمجة داخل الـ PDF أولاً
     for p_idx in pages_idx:
         page = doc[p_idx]
         try:
@@ -226,11 +227,9 @@ def scan_pdf_for_qr(doc, max_pages_to_scan=3, fast_mode=False) -> dict:
         except Exception:
             pass
 
-    # 2. تصوير الصفحة مع الزوم التلقائي للأركان
-    dpi_list = [200] if fast_mode else [200, 280]
     for p_idx in pages_idx:
         page = doc[p_idx]
-        for dpi in dpi_list:
+        for dpi in [200]:
             try:
                 pix = page.get_pixmap(dpi=dpi)
                 img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
@@ -340,7 +339,6 @@ def extract_invoice_number(text: str, filename: str) -> str:
         if mm:
             return mm.group(1)
 
-    # إذا كانت فاتورة شركة باب العالمية بدون رقم فاتورة مطبوع بداخلها
     if "300048882800003" in text or "Bab International" in text:
         return ""
 
@@ -436,7 +434,7 @@ def extract_amounts(text: str, qr_info: dict = None) -> tuple:
     return (round(tb, 2), round(vat, 2), round(ta, 2))
 
 # ==========================================
-# 5. استخراج البيانات محلياً مع التعلم التلقائي للموردين الجدد
+# 5. استخراج البيانات محلياً مع التعلم التلقائي
 # ==========================================
 def local_smart_extract(text: str, filename: str, qr_info: dict = None) -> dict:
     doc_type = detect_document_type(text, filename)
@@ -767,7 +765,7 @@ def analyze_unit(unit: dict, api_key: str) -> list:
     return [audited]
 
 # ==========================================
-# 9. تصدير الإكسيل (الفواتير + الإشعارات المدينة معاً، والإشعارات الدائنة في شيت مستقل)
+# 9. تصدير الإكسيل
 # ==========================================
 def build_formatted_df(sub_df: pd.DataFrame, include_error_reason: bool = False) -> pd.DataFrame:
     if sub_df.empty:
@@ -826,15 +824,12 @@ def export_to_excel(records: list, output_path: str):
     inv_counts = df["invoice_number"].replace("", np.nan).dropna().value_counts()
     duplicate_invs = set(inv_counts[inv_counts > 1].index)
 
-    # 1. تحديد الإشعارات الدائنة فقط في شيت مستقل
     credit_notes_mask = df["doc_type"].astype(str).str.contains("دائن", na=False)
     df_credit_notes_raw = df[credit_notes_mask].copy()
 
-    # 2. الفواتير الضريبية والإشعارات المدينة السليمة معاً في الشيت الأول
     valid_mask = (df["is_valid_zatca"] == True) & (~credit_notes_mask)
     df_valid_raw = df[valid_mask].copy()
 
-    # 3. الفواتير والإشعارات المدينة التي بها أخطاء أو بدون QR في شيت الأخطاء
     error_mask = (df["is_valid_zatca"] == False) & (~credit_notes_mask)
     df_error_raw = df[error_mask].copy()
 
@@ -842,7 +837,6 @@ def export_to_excel(records: list, output_path: str):
     df_sheet_credit = build_formatted_df(df_credit_notes_raw, include_error_reason=True)
     df_sheet_error = build_formatted_df(df_error_raw, include_error_reason=True)
 
-    # 4. ملخص الموردين الشامل (يطرح الإشعارات الدائنة تلقائياً من الصافي)
     sign_multiplier = np.where(credit_notes_mask, -1.0, 1.0)
     df_all_formatted = pd.DataFrame({
         "اسم المورد": df["vendor_name"],
