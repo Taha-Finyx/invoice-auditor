@@ -123,7 +123,7 @@ def save_vendor_to_db(tax_id: str, vendor_name: str):
             pass
 
 # ==========================================
-# 3. محرك فك التشفير الـ (ZATCA TLV) الآمن
+# 3. محرك فك التشفير وزوم الـ QR Code (ZATCA TLV)
 # ==========================================
 def decode_tlv_base64(b64_string: str) -> dict:
     try:
@@ -164,33 +164,72 @@ def try_decode_cv2_qr(img_bgr) -> dict:
         return None
     try:
         detector = cv2.QRCodeDetector()
-        # فحص سريع وآمن للصورة الأصلية فقط لمنع التجميد
-        data, _, _ = detector.detectAndDecode(img_bgr)
-        if data:
-            tlv = decode_tlv_base64(data)
-            if tlv:
-                return tlv
-            return {"qr_raw": data, "qr_total": None, "qr_tax": None, "qr_tax_id": ""}
+        h, w = img_bgr.shape[:2]
+
+        regions = [
+            ("full", img_bgr),
+            ("top_left", img_bgr[0:int(h*0.5), 0:int(w*0.5)]),
+            ("top_right", img_bgr[0:int(h*0.5), int(w*0.5):w]),
+            ("bottom_left", img_bgr[int(h*0.5):h, 0:int(w*0.5)]),
+            ("bottom_right", img_bgr[int(h*0.5):h, int(w*0.5):w]),
+        ]
+
+        for _, reg in regions:
+            if reg.size == 0:
+                continue
+            gray = cv2.cvtColor(reg, cv2.COLOR_BGR2GRAY)
+            for zoom in [1.0, 1.5, 2.0]:
+                try:
+                    resized = cv2.resize(gray, None, fx=zoom, fy=zoom, interpolation=cv2.INTER_CUBIC) if zoom != 1.0 else gray
+                    thresholds = [
+                        resized,
+                        cv2.threshold(resized, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+                    ]
+                    for t_img in thresholds:
+                        data, _, _ = detector.detectAndDecode(t_img)
+                        if data:
+                            tlv = decode_tlv_base64(data)
+                            if tlv:
+                                return tlv
+                            return {"qr_raw": data, "qr_total": None, "qr_tax": None, "qr_tax_id": ""}
+                except Exception:
+                    continue
     except Exception:
         pass
     return None
 
 def scan_pdf_for_qr(doc) -> dict:
-    if not HAS_CV2 or len(doc) == 0:
+    if not HAS_CV2:
         return None
-    try:
-        # فحص الصفحة الأولى فقط لضمان السرعة القصوى وعدم التعليق
-        page = doc[0]
-        pix = page.get_pixmap(dpi=150)
-        img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-        img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR if pix.n == 3 else cv2.COLOR_RGBA2BGR)
-        return try_decode_cv2_qr(img_bgr)
-    except Exception:
-        pass
+    for p_idx in range(min(len(doc), 2)):
+        page = doc[p_idx]
+        try:
+            for img_info in page.get_images(full=True):
+                xref = img_info[0]
+                base_img = doc.extract_image(xref)
+                img_bytes = base_img["image"]
+                img_np = np.frombuffer(img_bytes, np.uint8)
+                img_bgr = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+                if img_bgr is not None and img_bgr.shape[0] > 20 and img_bgr.shape[1] > 20:
+                    res = try_decode_cv2_qr(img_bgr)
+                    if res:
+                        return res
+        except Exception:
+            pass
+
+        try:
+            pix = page.get_pixmap(dpi=150)
+            img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+            img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR if pix.n == 3 else cv2.COLOR_RGBA2BGR)
+            res = try_decode_cv2_qr(img_bgr)
+            if res:
+                return res
+        except Exception:
+            continue
     return None
 
 # ==========================================
-# 4. دوال استخراج البيانات الأساسية
+# 4. دوال استخراج البيانات بدقة عالية
 # ==========================================
 def detect_document_type(text: str, filename: str) -> str:
     combined = f"{filename}\n{text[:3500]}".lower()
@@ -250,14 +289,17 @@ def extract_invoice_number(text: str, filename: str) -> str:
         r'(HS-(?:CPC-|ADS-)?\d{4}/\d+-\d+)',
         r'(INV/\d{4}/\d{2}/\d+)',
         r'(INV/\d{4}/\d+)',
-        r'Invoice\s*Number\s*[:\|]?\s*([A-Za-z0-9\-/]+)',
-        r'INVOICE\s+(\d{3,10})\b',
+        r'(SCR\d+)',
+        r'Invoice\s*(?:No\.?|Number|#)\s*[:\|]?\s*([A-Za-z0-9\-/]+)',
+        r'رقم\s+الفاتورة\s*[:\|]?\s*([A-Za-z0-9\-/]+)',
+        r'INVOICE\s+(\d{3,12})\b',
+        r'Document\s*Number[\s\S]{1,30}?(\d{5,12})\b',
     ]
     for pat in inv_patterns:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
             cand = m.group(1).strip()
-            if cand.lower() not in {"date", "total", "tax"} and cand not in CUSTOMER_VAT_NUMBERS:
+            if cand.lower() not in {"date", "total", "tax", "no", "number"} and cand not in CUSTOMER_VAT_NUMBERS:
                 return cand
 
     fname_patterns = [
@@ -265,7 +307,8 @@ def extract_invoice_number(text: str, filename: str) -> str:
         r'(INV[_/]\d{4}[_/]\d+)',
         r'(SA-B2B-INV-\d+)',
         r'(SINV\d+)',
-        r'(\d{7,10})\s+',
+        r'(SCR\d+)',
+        r'(\d{6,10})',
     ]
     for pat in fname_patterns:
         m = re.search(pat, filename, re.IGNORECASE)
@@ -715,7 +758,6 @@ if uploaded_files:
         raw_results = []
         completed = 0
 
-        # معالجة متسلسلة فائقة السرعة وآمنة تماماً ضد التعليق
         for t_info in task_queue:
             if t_info[0] == "zip":
                 res = process_task_from_disk(("zip", t_info[1], t_info[2]), t_info[3])
