@@ -33,7 +33,6 @@ def check_password():
 
     st.markdown("---")
     st.markdown("## 🔐 بوابة دخول المحاسبين المعتمدين")
-    st.markdown("يرجى إدخال كلمة المرور:")
     password_input = st.text_input("كلمة المرور", type="password")
     if st.button("تسجيل الدخول", type="primary"):
         if password_input == correct_password:
@@ -282,62 +281,77 @@ def perform_audit(data: dict) -> dict:
     return data
 
 # ==========================================
-# 4. واجهة المستخدم الذكية للملفات المتغيرة
+# 4. واجهة المستخدم التراكمية (Cumulative Batch Uploader)
 # ==========================================
 st.title("🧾 نظام تحليل المشتريات والفرز الضريبي (ZATCA)")
-st.markdown("ارفع فواتير الشهر الحالي مباشرة (سواء ملفات PDF فردية عدة أو مجلدات صغيرة مدعومة).")
+st.markdown("رفع ومعالجة الفواتير على دفعات متتالية لضمان استيعاب 3000 فاتورة وأكثر دون أي تعليق.")
 
-uploaded_files = st.file_uploader(
-    "اختر ملفات الفواتير الشهرية (يمكنك تحديد عدة ملفات PDF معاً)",
-    accept_multiple_files=True,
-    type=["pdf", "png", "jpg", "jpeg", "webp"]
+uploaded_zip = st.file_uploader(
+    "ارفع ملف ZIP يحتوي على دفعة من الفواتير (مثلاً 500-1000 فاتورة في كل ملف)",
+    type=["zip"]
 )
 
-if uploaded_files:
-    if st.button("🚀 بدء تحليل وفرز الفواتير الشهرية", type="primary"):
-        with st.spinner("جاري قراءة وتحليل الفواتير الشهرية..."):
-            raw_results = []
-            total_files = len(uploaded_files)
-            progress_bar = st.progress(0)
+if "cumulative_results" not in st.session_state:
+    st.session_state["cumulative_results"] = []
 
-            for i, uf in enumerate(uploaded_files):
-                fname = uf.name
-                file_bytes = uf.read()
-                text_content = ""
-                
-                if fname.lower().endswith(".pdf"):
-                    try:
-                        doc = fitz.open(stream=file_bytes, filetype="pdf")
-                        text_content = "\n".join([page.get_text("text") for page in doc])
-                        doc.close()
-                    except Exception:
-                        pass
+if uploaded_zip:
+    if st.button("➕ إضافة ومعالجة هذه الدفعة للتقرير العام", type="primary"):
+        with st.spinner("جاري فك ومعالجة الدفعة الحالية..."):
+            temp_dir = tempfile.mkdtemp()
+            zip_path = os.path.join(temp_dir, uploaded_zip.name)
+            with open(zip_path, "wb") as f:
+                f.write(uploaded_zip.getbuffer())
 
-                local_data = local_smart_extract(text_content, fname)
-                local_data["اسم_الملف"] = fname
-                audited = perform_audit(local_data)
-                raw_results.append(audited)
-                
-                progress_bar.progress((i + 1) / max(total_files, 1))
+            batch_results = []
+            valid_exts = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
+            
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                members = [m for m in zf.infolist() if not m.is_dir() and m.filename.lower().endswith(valid_exts)]
+                for member in members:
+                    base_m = os.path.basename(member.filename)
+                    if base_m.startswith("._") or base_m.startswith("."):
+                        continue
+                    
+                    file_bytes = zf.read(member.filename)
+                    text_content = ""
+                    if base_m.lower().endswith(".pdf"):
+                        try:
+                            doc = fitz.open(stream=file_bytes, filetype="pdf")
+                            text_content = "\n".join([page.get_text("text") for page in doc])
+                            doc.close()
+                        except Exception:
+                            pass
 
-            st.session_state["monthly_results"] = raw_results
-            st.success(f"✓ تم إنجاز تحليل {len(raw_results)} فاتورة شهرية بنجاح!")
+                    local_data = local_smart_extract(text_content, base_m)
+                    local_data["اسم_الملف"] = base_m
+                    audited = perform_audit(local_data)
+                    batch_results.append(audited)
 
-if "monthly_results" in st.session_state and st.session_state["monthly_results"]:
-    raw_results = st.session_state["monthly_results"]
-    df = pd.DataFrame(raw_results)
+            # إضافة نتائج الدفعة للذاكرة العامة
+            st.session_state["cumulative_results"].extend(batch_results)
+            st.success(f"✓ تمت إضافة هذه الدفعة بنجاح! الإجمالي الحالي المعالج: {len(st.session_state['cumulative_results'])} فاتورة.")
+
+if st.session_state["cumulative_results"]:
+    total_count = len(st.session_state["cumulative_results"])
+    st.info(bytes(f"📊 عدد الفواتير الإجمالي حتى الآن: **{total_count}** فاتورة.", "utf-8").decode("utf-8"))
+
+    if st.button("🗑 مسح الذاكرة وبدء دورة جديدة"):
+        st.session_state["cumulative_results"] = []
+        st.rerun()
+
+    df = pd.DataFrame(st.session_state["cumulative_results"])
+    output_excel = "تقرير_المشتريات_الشامل_3000.xlsx"
     
-    output_excel = "تحليل_المشتريات_الشهرية_ZATCA.xlsx"
     with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="النتائج الشهرية")
-        ws = writer.sheets["النتائج الشهرية"]
+        df.to_excel(writer, index=False, sheet_name="الشامل")
+        ws = writer.sheets["الشامل"]
         ws.views.sheetView[0].rightToLeft = True
 
     with open(output_excel, "rb") as f:
         st.download_button(
-            label="📥 تحميل تقرير الإكسيل الشهري النهائي",
+            label="📥 تحميل تقرير الإكسيل الشامل لكل الدفعات حتى الآن",
             data=f,
-            file_name="تقرير_المشتريات_الشهرية.xlsx",
+            file_name="تقرير_المشتريات_الشامل.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary"
         )
