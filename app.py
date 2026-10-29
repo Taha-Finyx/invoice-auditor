@@ -101,7 +101,7 @@ def save_vendor_to_db(tax_id: str, vendor_name: str):
         pass
 
 # ==========================================
-# 3. محرك استخراج وتحليل الفواتير الذكي
+# 3. محرك الاستخراج والتحليل الفوري
 # ==========================================
 def detect_document_type(text: str, filename: str) -> str:
     combined = f"{filename}\n{text[:3500]}".lower()
@@ -282,69 +282,62 @@ def perform_audit(data: dict) -> dict:
     return data
 
 # ==========================================
-# 4. واجهة المستخدم والتنفيذ المحلي من مجلد المشروع
+# 4. واجهة المستخدم الذكية للملفات المتغيرة
 # ==========================================
 st.title("🧾 نظام تحليل المشتريات والفرز الضريبي (ZATCA)")
-st.markdown("وضع التشغيل المباشر من ملفات الخادم لتجاوز قيود الرفع بالحجم الكبير.")
+st.markdown("ارفع فواتير الشهر الحالي مباشرة (سواء ملفات PDF فردية عدة أو مجلدات صغيرة مدعومة).")
 
-default_zip_name = "invoices_batch.zip"
-zip_input = st.text_input("اسم ملف الـ ZIP الموجود على المستودع:", value=default_zip_name)
+uploaded_files = st.file_uploader(
+    "اختر ملفات الفواتير الشهرية (يمكنك تحديد عدة ملفات PDF معاً)",
+    accept_multiple_files=True,
+    type=["pdf", "png", "jpg", "jpeg", "webp"]
+)
 
-if st.button("🚀 بدء التحليل الفوري للملفات الموجودة", type="primary"):
-    if not os.path.exists(zip_input):
-        st.error(f"❌ الملف '{zip_input}' غير موجود في مجلد المستودع على GitHub. يرجى رفع الملف أولاً إلى المستودع.")
-    else:
-        with st.spinner("جاري قراءة وفحص الفواتير مباشرة من الخادم..."):
+if uploaded_files:
+    if st.button("🚀 بدء تحليل وفرز الفواتير الشهرية", type="primary"):
+        with st.spinner("جاري قراءة وتحليل الفواتير الشهرية..."):
             raw_results = []
-            valid_exts = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
-            try:
-                with zipfile.ZipFile(zip_input, "r") as zf:
-                    members = [m for m in zf.infolist() if not m.is_dir() and m.filename.lower().endswith(valid_exts)]
-                    total_files = len(members)
-                    progress_bar = st.progress(0)
-                    
-                    for i, member in enumerate(members):
-                        base_m = os.path.basename(member.filename)
-                        if base_m.startswith("._") or base_m.startswith("."):
-                            continue
-                        
-                        file_bytes = zf.read(member.filename)
-                        text_content = ""
-                        if base_m.lower().endswith(".pdf"):
-                            try:
-                                doc = fitz.open(stream=file_bytes, filetype="pdf")
-                                text_content = "\n".join([page.get_text("text") for page in doc])
-                                doc.close()
-                            except Exception:
-                                pass
+            total_files = len(uploaded_files)
+            progress_bar = st.progress(0)
 
-                        local_data = local_smart_extract(text_content, base_m)
-                        local_data["اسم_الملف"] = base_m
-                        audited = perform_audit(local_data)
-                        raw_results.append(audited)
-                        
-                        progress_bar.progress((i + 1) / max(total_files, 1))
+            for i, uf in enumerate(uploaded_files):
+                fname = uf.name
+                file_bytes = uf.read()
+                text_content = ""
+                
+                if fname.lower().endswith(".pdf"):
+                    try:
+                        doc = fitz.open(stream=file_bytes, filetype="pdf")
+                        text_content = "\n".join([page.get_text("text") for page in doc])
+                        doc.close()
+                    except Exception:
+                        pass
 
-                st.session_state["last_audit_results"] = raw_results
-                st.success(f"✓ تمت معالجة {len(raw_results)} مستند بنجاح تام!")
-            except Exception as e:
-                st.error(f"حدث خطأ أثناء معالجة الملف: {e}")
+                local_data = local_smart_extract(text_content, fname)
+                local_data["اسم_الملف"] = fname
+                audited = perform_audit(local_data)
+                raw_results.append(audited)
+                
+                progress_bar.progress((i + 1) / max(total_files, 1))
 
-if "last_audit_results" in st.session_state and st.session_state["last_audit_results"]:
-    raw_results = st.session_state["last_audit_results"]
+            st.session_state["monthly_results"] = raw_results
+            st.success(f"✓ تم إنجاز تحليل {len(raw_results)} فاتورة شهرية بنجاح!")
+
+if "monthly_results" in st.session_state and st.session_state["monthly_results"]:
+    raw_results = st.session_state["monthly_results"]
     df = pd.DataFrame(raw_results)
     
-    output_excel = "تحليل_المشتريات_المصنف_ZATCA.xlsx"
+    output_excel = "تحليل_المشتريات_الشهرية_ZATCA.xlsx"
     with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="النتائج")
-        ws = writer.sheets["النتائج"]
+        df.to_excel(writer, index=False, sheet_name="النتائج الشهرية")
+        ws = writer.sheets["النتائج الشهرية"]
         ws.views.sheetView[0].rightToLeft = True
 
     with open(output_excel, "rb") as f:
         st.download_button(
-            label="📥 تحميل تقرير الإكسيل النهائي",
+            label="📥 تحميل تقرير الإكسيل الشهري النهائي",
             data=f,
-            file_name="تحليل_المشتريات_المصنف.xlsx",
+            file_name="تقرير_المشتريات_الشهرية.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary"
         )
