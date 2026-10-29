@@ -13,8 +13,8 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import fitz  # PyMuPDF
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+import pymupdf  # استبدال fitz بـ pymupdf مباشرة لتجنب التحذيرات
+from openpyxl.styles import PatternFill, Font, Alignment
 
 try:
     import cv2
@@ -84,7 +84,7 @@ KNOWN_VENDORS_BY_VAT = {
 }
 
 # ==========================================
-# 3. محرك فك تشفير وقراءة الـ QR Code (ZATCA TLV)
+# 3. محرك فك تشفير وقراءة الـ QR Code (ZATCA TLV) الآمن
 # ==========================================
 def decode_tlv_base64(b64_string: str) -> dict:
     try:
@@ -120,35 +120,32 @@ def decode_tlv_base64(b64_string: str) -> dict:
     except Exception:
         return None
 
-def try_decode_cv2_qr(img_bgr, fast_mode=False) -> dict:
+def try_decode_cv2_qr(img_bgr) -> dict:
     if not HAS_CV2 or img_bgr is None:
         return None
     try:
         detector = cv2.QRCodeDetector()
-        bordered = cv2.copyMakeBorder(img_bgr, 30, 30, 30, 30, cv2.BORDER_CONSTANT, value=[255, 255, 255])
-        gray = cv2.cvtColor(bordered, cv2.COLOR_BGR2GRAY)
-
-        scales = [1.0, 1.5] if fast_mode else [1.0, 1.5, 2.0]
-        thresholds = [None, 150] if fast_mode else [None, 150, 128]
-
-        for scale in scales:
-            try:
-                resized = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC) if scale != 1.0 else gray
-                for thresh_val in thresholds:
-                    test_img = resized if thresh_val is None else cv2.threshold(resized, thresh_val, 255, cv2.THRESH_BINARY)[1]
-                    data, _, _ = detector.detectAndDecode(test_img)
-                    if data:
-                        tlv = decode_tlv_base64(data)
-                        if tlv:
-                            return tlv
-                        return {"qr_raw": data, "qr_total": None, "qr_tax": None, "qr_tax_id": ""}
-            except Exception:
-                continue
+        # محاولة قراءة مباشرة بدون تعديلات معقدة لتجنب تحذيرات ECI
+        data, _, _ = detector.detectAndDecode(img_bgr)
+        if data:
+            tlv = decode_tlv_base64(data)
+            if tlv:
+                return tlv
+            return {"qr_raw": data, "qr_total": None, "qr_tax": None, "qr_tax_id": ""}
+        
+        # محاولة ثانية باللون الرمادي إذا لم يتم الكشف من أول مرة
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        data, _, _ = detector.detectAndDecode(gray)
+        if data:
+            tlv = decode_tlv_base64(data)
+            if tlv:
+                return tlv
+            return {"qr_raw": data, "qr_total": None, "qr_tax": None, "qr_tax_id": ""}
     except Exception:
         pass
     return None
 
-def scan_pdf_for_qr(doc, max_pages_to_scan=2, fast_mode=False) -> dict:
+def scan_pdf_for_qr(doc, max_pages_to_scan=2) -> dict:
     if not HAS_CV2:
         return None
     
@@ -156,7 +153,7 @@ def scan_pdf_for_qr(doc, max_pages_to_scan=2, fast_mode=False) -> dict:
     if len(doc) > max_pages_to_scan and (len(doc) - 1) not in pages_idx:
         pages_idx.append(len(doc) - 1)
 
-    # 1. فحص الصور المدمجة داخل الـ PDF
+    # 1. فحص الصور المدمجة داخل الـ PDF أولاً (أسرع وأدق)
     for p_idx in pages_idx:
         page = doc[p_idx]
         try:
@@ -167,20 +164,20 @@ def scan_pdf_for_qr(doc, max_pages_to_scan=2, fast_mode=False) -> dict:
                 img_np = np.frombuffer(img_bytes, np.uint8)
                 img_bgr = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
                 if img_bgr is not None and img_bgr.shape[0] > 20 and img_bgr.shape[1] > 20:
-                    res = try_decode_cv2_qr(img_bgr, fast_mode=fast_mode)
+                    res = try_decode_cv2_qr(img_bgr)
                     if res:
                         return res
         except Exception:
             pass
 
-    # 2. تصوير الصفحة
+    # 2. تصوير الصفحة بجودة متوازنة
     for p_idx in pages_idx:
         page = doc[p_idx]
         try:
-            pix = page.get_pixmap(dpi=150)
+            pix = page.get_pixmap(dpi=140)
             img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
             img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR if pix.n == 3 else cv2.COLOR_RGBA2BGR)
-            res = try_decode_cv2_qr(img_bgr, fast_mode=fast_mode)
+            res = try_decode_cv2_qr(img_bgr)
             if res:
                 return res
         except Exception:
@@ -188,7 +185,7 @@ def scan_pdf_for_qr(doc, max_pages_to_scan=2, fast_mode=False) -> dict:
     return None
 
 # ==========================================
-# 4. دوال استخراج البيانات والتواريخ
+# 4. دوال استخراج البيانات والتواريخ والمبالغ
 # ==========================================
 def detect_document_type(text: str, filename: str) -> str:
     combined = f"{filename}\n{text[:3000]}".lower()
@@ -265,8 +262,7 @@ def extract_invoice_number(text: str, filename: str) -> str:
     for pat in fname_patterns:
         m = re.search(pat, filename, re.IGNORECASE)
         if m:
-            val = m.group(1).replace("_", "/")
-            return val
+            return m.group(1).replace("_", "/")
     return ""
 
 def extract_amounts(text: str, qr_info: dict = None) -> tuple:
@@ -430,7 +426,7 @@ def perform_audit_and_qr_match(data: dict, qr_info: dict = None) -> dict:
 # ==========================================
 # 6. البث المباشر ومعالجة الملفات من القرص
 # ==========================================
-def process_task_from_disk(task_info: tuple, split_branches: bool, api_key: str, fast_mode: bool) -> list:
+def process_task_from_disk(task_info: tuple, split_branches: bool, api_key: str) -> list:
     task_type, path_or_zip, internal_name, display_name = task_info
     try:
         if task_type == "zip":
@@ -440,7 +436,7 @@ def process_task_from_disk(task_info: tuple, split_branches: bool, api_key: str,
             with open(path_or_zip, "rb") as fp:
                 file_bytes = fp.read()
 
-        return process_and_analyze_bytes(file_bytes, display_name, split_branches, api_key, fast_mode)
+        return process_and_analyze_bytes(file_bytes, display_name, split_branches, api_key)
     except Exception as e:
         return [{
             "invoice_date": "", "invoice_number": "", "doc_type": "خطأ قراءة",
@@ -449,7 +445,7 @@ def process_task_from_disk(task_info: tuple, split_branches: bool, api_key: str,
             "qr_status": "❌ خطأ", "audit_status": "❌ تلف", "اسم_الملف": display_name
         }]
 
-def process_and_analyze_bytes(file_bytes: bytes, filename: str, split_branches: bool, api_key: str, fast_mode: bool) -> list:
+def process_and_analyze_bytes(file_bytes: bytes, filename: str, split_branches: bool, api_key: str) -> list:
     if filename.lower().endswith(".pdf"):
         pdf_start = file_bytes.find(b"%PDF-")
         if pdf_start > 0:
@@ -459,8 +455,8 @@ def process_and_analyze_bytes(file_bytes: bytes, filename: str, split_branches: 
     results = []
     try:
         if ext.endswith(".pdf"):
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            qr_info = scan_pdf_for_qr(doc, max_pages_to_scan=2, fast_mode=fast_mode)
+            doc = pymupdf.open(stream=file_bytes, filetype="pdf")
+            qr_info = scan_pdf_for_qr(doc, max_pages_to_scan=2)
 
             combined_text = "\n".join([page.get_text("text") for page in doc]).strip()
             local_data = local_smart_extract(combined_text, filename, qr_info)
@@ -479,7 +475,7 @@ def process_and_analyze_bytes(file_bytes: bytes, filename: str, split_branches: 
             if HAS_CV2:
                 img_np = np.frombuffer(file_bytes, np.uint8)
                 img_bgr = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
-                qr_info = try_decode_cv2_qr(img_bgr, fast_mode=fast_mode)
+                qr_info = try_decode_cv2_qr(img_bgr)
             unit = {
                 "filename": filename,
                 "text_content": "",
@@ -631,7 +627,6 @@ with st.sidebar:
         st.success("✓ مفتاح الذكاء الاصطناعي متصل")
 
     split_branches = st.checkbox("تقسيم صفحات الفروع الداخلية", value=False)
-    fast_mode_toggle = st.checkbox("⚡ الوضع الفائق (Turbo)", value=True)
     max_workers = st.slider("عدد المسارات المتوازية (Workers)", 1, 32, 12)
 
 uploaded_files = st.file_uploader(
@@ -674,14 +669,13 @@ if uploaded_files:
         
         raw_results = []
         completed = 0
-        use_fast = fast_mode_toggle or (total_files > 150)
 
         BATCH_SIZE = 100
         for batch_start in range(0, total_files, BATCH_SIZE):
             batch = task_queue[batch_start : batch_start + BATCH_SIZE]
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = [
-                    executor.submit(process_task_from_disk, t_info, split_branches, api_key, use_fast)
+                    executor.submit(process_task_from_disk, t_info, split_branches, api_key)
                     for t_info in batch
                 ]
                 for future in as_completed(futures):
