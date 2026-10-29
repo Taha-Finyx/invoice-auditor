@@ -3,11 +3,9 @@ import os
 import re
 import io
 import gc
-import tempfile
 import zipfile
 import json
 import base64
-import threading
 from datetime import datetime
 import pandas as pd
 import numpy as np
@@ -35,7 +33,7 @@ def check_password():
 
     st.markdown("---")
     st.markdown("## 🔐 بوابة دخول المحاسبين المعتمدين")
-    st.markdown("هذا النظام مخصص لتدقيق وتحليل فواتير المشتريات الضريبية. يرجى إدخال كلمة المرور:")
+    st.markdown("يرجى إدخال كلمة المرور:")
     password_input = st.text_input("كلمة المرور", type="password")
     if st.button("تسجيل الدخول", type="primary"):
         if password_input == correct_password:
@@ -49,12 +47,11 @@ if not check_password():
     st.stop()
 
 # ==========================================
-# 2. ثوابت ونظام الذاكرة الديناميكية للموردين
+# 2. الثوابت وقاعدة بيانات الموردين
 # ==========================================
 TOLERANCE = 0.05
 CUSTOMER_VAT_NUMBERS = {"313066974700003"}
 VENDORS_DB_FILE = "vendors_db.json"
-DB_LOCK = threading.Lock()
 
 DEFAULT_VENDORS = {
     "300067077700003": "شركة مطاعم ركن هاشم",
@@ -79,15 +76,14 @@ DEFAULT_VENDORS = {
 
 def load_vendors_db() -> dict:
     db = DEFAULT_VENDORS.copy()
-    with DB_LOCK:
-        try:
-            if os.path.exists(VENDORS_DB_FILE):
-                with open(VENDORS_DB_FILE, "r", encoding="utf-8") as f:
-                    saved = json.load(f)
-                    if isinstance(saved, dict):
-                        db.update(saved)
-        except Exception:
-            pass
+    try:
+        if os.path.exists(VENDORS_DB_FILE):
+            with open(VENDORS_DB_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+                if isinstance(saved, dict):
+                    db.update(saved)
+    except Exception:
+        pass
     return db
 
 def save_vendor_to_db(tax_id: str, vendor_name: str):
@@ -95,26 +91,17 @@ def save_vendor_to_db(tax_id: str, vendor_name: str):
         return
     if tax_id in CUSTOMER_VAT_NUMBERS or vendor_name.isdigit():
         return
-    with DB_LOCK:
-        try:
-            db = DEFAULT_VENDORS.copy()
-            if os.path.exists(VENDORS_DB_FILE):
-                try:
-                    with open(VENDORS_DB_FILE, "r", encoding="utf-8") as f:
-                        saved = json.load(f)
-                        if isinstance(saved, dict):
-                            db.update(saved)
-                except Exception:
-                    pass
-            if tax_id not in db:
-                db[tax_id] = vendor_name.strip()
-                with open(VENDORS_DB_FILE, "w", encoding="utf-8") as f:
-                    json.dump(db, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+    try:
+        db = load_vendors_db()
+        if tax_id not in db:
+            db[tax_id] = vendor_name.strip()
+            with open(VENDORS_DB_FILE, "w", encoding="utf-8") as f:
+                json.dump(db, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 # ==========================================
-# 3. دوال استخراج البيانات الذكية (فائقة السرعة)
+# 3. محرك استخراج وتحليل الفواتير الذكي
 # ==========================================
 def detect_document_type(text: str, filename: str) -> str:
     combined = f"{filename}\n{text[:3500]}".lower()
@@ -174,7 +161,6 @@ def extract_invoice_number(text: str, filename: str) -> str:
         r'Invoice\s*(?:No\.?|Number|#)\s*[:\|]?\s*([A-Za-z0-9\-/]+)',
         r'رقم\s+الفاتورة\s*[:\|]?\s*([A-Za-z0-9\-/]+)',
         r'INVOICE\s+(\d{3,15})\b',
-        r'Document\s*Number[\s\S]{1,30}?(\d{5,15})\b',
     ]
     for pat in inv_patterns:
         m = re.search(pat, text, re.IGNORECASE)
@@ -201,7 +187,6 @@ def extract_invoice_number(text: str, filename: str) -> str:
 
 def extract_amounts(text: str) -> tuple:
     tb, vat, ta = 0.0, 0.0, 0.0
-
     tb_m = re.search(r'(?:Total\s+Before\s+Tax|Total\s+Excl\.\s+VAT|SUBTOTAL|الإجمالي\s+الفرعي|المبلغ\s+بدون\s+ضريبة)[\s:.\-\|SRSAR]*([\d,]+\.\d{1,2})', text, re.IGNORECASE)
     vat_m = re.search(r'(?:VAT\s*15\.?0?%|Total\s+VAT|ضريبة\s+القيمة\s+المضافة)[\s:.\-\|SRSAR]*([\d,]+\.\d{1,2})', text, re.IGNORECASE)
     ta_m = re.search(r'(?:Total\s+Invoice\s+After\s+VAT|Total\s+Amount\s+Due|Grand\s+Total|TOTAL|الإجمالي\s+الشامل|إجمالي\s+المستحقات|Net\s+Due\s+Invoice)[\s:.\-\|SRSAR]*([\d,]+\.\d{1,2})', text, re.IGNORECASE)
@@ -292,174 +277,68 @@ def perform_audit(data: dict) -> dict:
 
     is_clean = len(error_reasons) == 0
     data["is_valid_zatca"] = is_clean
-    data["qr_status"] = "✓ فحص نصي سريع"
+    data["qr_status"] = "✓ فحص نصي مباشر"
     data["error_reason"] = "✓ سليم ومطابق" if is_clean else " ، ".join(error_reasons)
     return data
 
 # ==========================================
-# 4. المعالجة الفائقة والسرعة القسوى (Turbo Text-Extraction)
-# ==========================================
-def process_single_file_task(task_info: tuple) -> list:
-    task_type, path_or_zip, internal_name, display_name = task_info
-    try:
-        if task_type == "zip":
-            with zipfile.ZipFile(path_or_zip, "r") as zf:
-                file_bytes = zf.read(internal_name)
-        else:
-            with open(path_or_zip, "rb") as fp:
-                file_bytes = fp.read()
-
-        if display_name.lower().endswith(".pdf"):
-            doc = fitz.open(stream=file_bytes, filetype="pdf")
-            text_content = "\n".join([page.get_text("text") for page in doc])
-            doc.close()
-        else:
-            text_content = ""
-
-        local_data = local_smart_extract(text_content, display_name)
-        local_data["اسم_الملف"] = display_name
-        audited = perform_audit(local_data)
-        return [audited]
-    except Exception as e:
-        return [{
-            "invoice_date": "",
-            "invoice_number": "",
-            "doc_type": "خطأ قراءة",
-            "vendor_name": f"خطأ: {str(e)[:30]}",
-            "tax_id": "",
-            "total_before_vat": 0.0,
-            "vat_value": 0.0,
-            "total_after_vat": 0.0,
-            "qr_status": "❌ تعذر الفحص",
-            "audit_status": "❌ ملف تالف",
-            "is_valid_zatca": False,
-            "error_reason": "تعذر فتح الملف",
-            "اسم_الملف": display_name
-        }]
-
-# ==========================================
-# 5. تصدير الإكسيل
-# ==========================================
-def build_formatted_df(sub_df: pd.DataFrame, include_error_reason: bool = False) -> pd.DataFrame:
-    if sub_df.empty:
-        cols = [
-            "التاريخ", "رقم الفاتورة", "نوع المستند", "اسم المورد",
-            "رقم التسجيل الضريبي", "الاجمالي قبل الضريبية",
-            "ضريبة القيمة المضافة (15%)", "الاجمالي بعد الضريبة",
-            "حالة الـ QR Code", "التدقيق المحاسبي"
-        ]
-        if include_error_reason:
-            cols.append("سبب الاستبعاد / نوع الخطأ")
-        cols.append("اسم الملف المرفوع")
-        return pd.DataFrame(columns=cols)
-
-    df_out = pd.DataFrame({
-        "التاريخ": sub_df["invoice_date"],
-        "رقم الفاتورة": sub_df["invoice_number"],
-        "نوع المستند": sub_df["doc_type"],
-        "اسم المورد": sub_df["vendor_name"],
-        "رقم التسجيل الضريبي": sub_df["tax_id"],
-        "الاجمالي قبل الضريبية": pd.to_numeric(sub_df["total_before_vat"], errors="coerce").fillna(0.0),
-        "ضريبة القيمة المضافة (15%)": pd.to_numeric(sub_df["vat_value"], errors="coerce").fillna(0.0),
-        "الاجمالي بعد الضريبة": pd.to_numeric(sub_df["total_after_vat"], errors="coerce").fillna(0.0),
-        "حالة الـ QR Code": sub_df["qr_status"],
-        "التدقيق المحاسبي": sub_df["audit_status"],
-    })
-
-    if include_error_reason:
-        df_out["سبب الاستبعاد / نوع الخطأ"] = sub_df["error_reason"]
-
-    df_out["اسم الملف المرفوع"] = sub_df["اسم_الملف"]
-    return df_out
-
-def export_to_excel(records: list, output_path: str):
-    df = pd.DataFrame(records)
-    if df.empty:
-        return
-
-    credit_notes_mask = df["doc_type"].astype(str).str.contains("دائن", na=False)
-    df_credit_notes_raw = df[credit_notes_mask].copy()
-
-    valid_mask = (df["is_valid_zatca"] == True) & (~credit_notes_mask)
-    df_valid_raw = df[valid_mask].copy()
-
-    error_mask = (df["is_valid_zatca"] == False) & (~credit_notes_mask)
-    df_error_raw = df[error_mask].copy()
-
-    df_sheet_valid = build_formatted_df(df_valid_raw, include_error_reason=False)
-    df_sheet_credit = build_formatted_df(df_credit_notes_raw, include_error_reason=True)
-    df_sheet_error = build_formatted_df(df_error_raw, include_error_reason=True)
-
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        df_sheet_valid.to_excel(writer, index=False, sheet_name="الفواتير والإشعارات المدينة")
-        df_sheet_credit.to_excel(writer, index=False, sheet_name="الإشعارات الدائنة")
-        df_sheet_error.to_excel(writer, index=False, sheet_name="فواتير بها أخطاء")
-
-        for sheet_name in writer.sheets:
-            ws = writer.sheets[sheet_name]
-            ws.views.sheetView[0].rightToLeft = True
-            for col in ws.columns:
-                col_letter = col[0].column_letter
-                ws.column_dimensions[col_letter].width = 22
-
-# ==========================================
-# 6. واجهة المستخدم
+# 4. واجهة المستخدم والتنفيذ المحلي من مجلد المشروع
 # ==========================================
 st.title("🧾 نظام تحليل المشتريات والفرز الضريبي (ZATCA)")
-st.markdown("وضع **السرعة الفائقة** معالج خصخصياً لفك وفحص آلاف الفواتير الضخمة في أجزاء من الثانية بدقة تامة.")
+st.markdown("وضع التشغيل المباشر من ملفات الخادم لتجاوز قيود الرفع بالحجم الكبير.")
 
-uploaded_files = st.file_uploader(
-    "ارفع ملف ZIP أو ملفات الفواتير (PDF / صور)",
-    accept_multiple_files=True,
-    type=["zip", "pdf", "png", "jpg", "jpeg", "webp"]
-)
+default_zip_name = "invoices_batch.zip"
+zip_input = st.text_input("اسم ملف الـ ZIP الموجود على المستودع:", value=default_zip_name)
 
-if uploaded_files:
-    if st.button("🚀 بدء التحليل الفائق السرعة", type="primary"):
-        temp_dir = tempfile.mkdtemp()
-        task_queue = []
-        valid_exts = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
+if st.button("🚀 بدء التحليل الفوري للملفات الموجودة", type="primary"):
+    if not os.path.exists(zip_input):
+        st.error(f"❌ الملف '{zip_input}' غير موجود في مجلد المستودع على GitHub. يرجى رفع الملف أولاً إلى المستودع.")
+    else:
+        with st.spinner("جاري قراءة وفحص الفواتير مباشرة من الخادم..."):
+            raw_results = []
+            valid_exts = (".pdf", ".png", ".jpg", ".jpeg", ".webp")
+            try:
+                with zipfile.ZipFile(zip_input, "r") as zf:
+                    members = [m for m in zf.infolist() if not m.is_dir() and m.filename.lower().endswith(valid_exts)]
+                    total_files = len(members)
+                    progress_bar = st.progress(0)
+                    
+                    for i, member in enumerate(members):
+                        base_m = os.path.basename(member.filename)
+                        if base_m.startswith("._") or base_m.startswith("."):
+                            continue
+                        
+                        file_bytes = zf.read(member.filename)
+                        text_content = ""
+                        if base_m.lower().endswith(".pdf"):
+                            try:
+                                doc = fitz.open(stream=file_bytes, filetype="pdf")
+                                text_content = "\n".join([page.get_text("text") for page in doc])
+                                doc.close()
+                            except Exception:
+                                pass
 
-        with st.spinner("جاري فك وفهرسة الملفات بسرعة صاروخية..."):
-            for idx, uf in enumerate(uploaded_files):
-                fname = uf.name
-                temp_path = os.path.join(temp_dir, f"upload_{idx}_{os.path.basename(fname)}")
-                with open(temp_path, "wb") as out_f:
-                    out_f.write(uf.getbuffer())
+                        local_data = local_smart_extract(text_content, base_m)
+                        local_data["اسم_الملف"] = base_m
+                        audited = perform_audit(local_data)
+                        raw_results.append(audited)
+                        
+                        progress_bar.progress((i + 1) / max(total_files, 1))
 
-                if fname.lower().endswith(".zip"):
-                    try:
-                        with zipfile.ZipFile(temp_path, "r") as zf:
-                            for member in zf.infolist():
-                                if not member.is_dir() and member.filename.lower().endswith(valid_exts):
-                                    base_m = os.path.basename(member.filename)
-                                    if not base_m.startswith("._") and not base_m.startswith("."):
-                                        task_queue.append(("zip", temp_path, member.filename, base_m))
-                    except Exception as e:
-                        st.error(f"خطأ في قراءة أرشيف {fname}: {e}")
-                else:
-                    task_queue.append(("file", temp_path, "", fname))
-
-        total_files = len(task_queue)
-        st.info(f"📂 تم تجهيز **{total_files}** مستند. جاري الاستخراج...")
-
-        raw_results = []
-        progress_bar = st.progress(0)
-        
-        for i, t_info in enumerate(task_queue):
-            res = process_single_file_task(t_info)
-            if res:
-                raw_results.extend(res)
-            progress_bar.progress((i + 1) / max(total_files, 1))
-
-        st.session_state["last_audit_results"] = raw_results
-        st.success("✓ تم الانتهاء من التحليل بنجاح تام!")
+                st.session_state["last_audit_results"] = raw_results
+                st.success(f"✓ تمت معالجة {len(raw_results)} مستند بنجاح تام!")
+            except Exception as e:
+                st.error(f"حدث خطأ أثناء معالجة الملف: {e}")
 
 if "last_audit_results" in st.session_state and st.session_state["last_audit_results"]:
     raw_results = st.session_state["last_audit_results"]
+    df = pd.DataFrame(raw_results)
     
     output_excel = "تحليل_المشتريات_المصنف_ZATCA.xlsx"
-    export_to_excel(raw_results, output_excel)
+    with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="النتائج")
+        ws = writer.sheets["النتائج"]
+        ws.views.sheetView[0].rightToLeft = True
 
     with open(output_excel, "rb") as f:
         st.download_button(
