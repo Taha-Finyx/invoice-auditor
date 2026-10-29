@@ -3,6 +3,7 @@ import os
 import re
 import io
 import gc
+import tempfile
 import zipfile
 import json
 import base64
@@ -327,7 +328,6 @@ if uploaded_zip:
                     audited = perform_audit(local_data)
                     batch_results.append(audited)
 
-            # إضافة نتائج الدفعة للذاكرة العامة
             st.session_state["cumulative_results"].extend(batch_results)
             st.success(f"✓ تمت إضافة هذه الدفعة بنجاح! الإجمالي الحالي المعالج: {len(st.session_state['cumulative_results'])} فاتورة.")
 
