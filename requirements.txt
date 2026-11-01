@@ -6,4 +6,5 @@ pyzbar
 pdf2image
 Pillow
 opencv-python-headless
+numpy
 pypdf
