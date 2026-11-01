@@ -1,0 +1,3 @@
+libzbar0
+poppler-utils
+libgl1
